@@ -1,0 +1,131 @@
+#!/usr/bin/env node
+// mcp-safe-edit — the MCP surface. Thin on purpose: all behaviour lives in
+// core.js and edit.js so it can be tested without a server.
+//
+// Usage: node src/index.js <allowed-root> [more-roots...]
+
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { makeGuard, readFile, listBackups, readBackup, backup, atomicWrite, sha256, diff } from './core.js';
+import { editFile, writeFile, replaceLines, EditError } from './edit.js';
+
+const roots = process.argv.slice(2);
+if (!roots.length) {
+  console.error('Usage: mcp-safe-edit <allowed-root> [more-roots...]');
+  process.exit(1);
+}
+let assertAllowed;
+try { assertAllowed = makeGuard(roots); }
+catch (e) { console.error(`[safe-edit] FATAL: ${e.message}`); process.exit(1); }
+
+const nowStamp = () => new Date().toISOString();
+const ok = (o) => ({ content: [{ type: 'text', text: typeof o === 'string' ? o : JSON.stringify(o, null, 2) }] });
+const fail = (m, detail) => ({
+  content: [{ type: 'text', text: JSON.stringify({ error: m, ...(detail || {}) }, null, 2) }],
+  isError: true,
+});
+
+const S = (props, required = []) => ({ type: 'object', properties: props, required });
+const str = { type: 'string' };
+const num = { type: 'number' };
+const bool = { type: 'boolean' };
+
+const EDIT_ITEM = {
+  type: 'object',
+  properties: {
+    old: { type: 'string', description: 'Exact text to find. Matched literally — never as a regex.' },
+    new: { type: 'string', description: 'Replacement text. Inserted literally; $& and $1 are ordinary characters.' },
+    replace_all: { type: 'boolean', description: 'Replace every occurrence. Without this, more than one match is an error.' },
+    expect_count: { type: 'number', description: 'Assert the exact number of occurrences. Mismatch is an error and nothing is written.' },
+  },
+  required: ['old', 'new'],
+};
+
+const TOOLS = {
+  safe_read: {
+    desc: 'Read a file and return its content plus a sha256 token. Pass that token back as expect_sha256 when you edit, so an edit computed against a stale copy is refused instead of applied.',
+    schema: S({ path: str }, ['path']),
+    fn: ({ path: p }) => readFile(assertAllowed(p)),
+  },
+  safe_edit: {
+    desc: 'Apply one or more exact-text edits to a file. Every edit is validated against the original content BEFORE anything is written, so a batch is all-or-nothing. A match count other than the one you asserted is an error. Writes atomically and re-reads the file to prove what landed.',
+    schema: S({
+      path: str,
+      edits: { type: 'array', items: EDIT_ITEM },
+      expect_sha256: { type: 'string', description: 'The sha256 from safe_read. Omit only if you accept editing whatever is currently there.' },
+      dry_run: bool,
+    }, ['path', 'edits']),
+    fn: (a) => editFile(assertAllowed(a.path), { ...a, stamp: nowStamp() }),
+  },
+  safe_preview: {
+    desc: 'Exactly what safe_edit would do, without writing. Returns the diff and the resulting sha256.',
+    schema: S({ path: str, edits: { type: 'array', items: EDIT_ITEM }, expect_sha256: str }, ['path', 'edits']),
+    fn: (a) => editFile(assertAllowed(a.path), { ...a, dry_run: true, stamp: nowStamp() }),
+  },
+  safe_write: {
+    desc: 'Write whole-file content. Creating a new file is free; overwriting an existing one requires expect_sha256 (or the literal "*" to overwrite deliberately). Backs up the previous content first.',
+    schema: S({ path: str, content: str, expect_sha256: str, create_only: bool }, ['path', 'content']),
+    fn: (a) => writeFile(assertAllowed(a.path), { ...a, stamp: nowStamp() }),
+  },
+  safe_replace_lines: {
+    desc: 'Replace a line range, asserting what you expect to find there. For when the target text is not unique but its position is.',
+    schema: S({ path: str, start_line: num, end_line: num, expect_text: str, new_text: str, expect_sha256: str, dry_run: bool }, ['path', 'start_line', 'end_line', 'new_text']),
+    fn: (a) => replaceLines(assertAllowed(a.path), { ...a, stamp: nowStamp() }),
+  },
+  safe_verify: {
+    desc: 'Check whether a file still has the sha256 you expect. Cheap way to confirm an edit landed, or that nothing moved under you.',
+    schema: S({ path: str, expect_sha256: str }, ['path', 'expect_sha256']),
+    fn: ({ path: p, expect_sha256 }) => {
+      const f = readFile(assertAllowed(p));
+      return { path: f.path, matches: f.sha256 === expect_sha256, expected: expect_sha256, actual: f.sha256 };
+    },
+  },
+  safe_list_backups: {
+    desc: 'List the saved copies of a file, newest first. Every mutation through this server takes one first.',
+    schema: S({ path: str }, ['path']),
+    fn: ({ path: p }) => ({ path: assertAllowed(p), backups: listBackups(assertAllowed(p)) }),
+  },
+  safe_restore: {
+    desc: 'Restore a file from one of its backups. Backs up the current content first, so a restore is itself reversible.',
+    schema: S({ path: str, backup_id: str }, ['path', 'backup_id']),
+    fn: ({ path: p, backup_id }) => {
+      const abs = assertAllowed(p);
+      const restored = readBackup(abs, backup_id);
+      let current = '';
+      try { current = readFile(abs).content; } catch { /* file may be gone */ }
+      const safetyId = current ? backup(abs, current, nowStamp()) : null;
+      const shaAfter = atomicWrite(abs, restored);
+      return {
+        path: abs, restored_from: backup_id, safety_backup_id: safetyId,
+        sha256_after: shaAfter, diff: diff(current, restored), verified: true,
+      };
+    },
+  },
+  safe_allowed_roots: {
+    desc: 'List the directories this server is permitted to touch.',
+    schema: S({}),
+    fn: () => ({ roots: roots.map((r) => { try { return assertAllowed(r); } catch { return `${r} (invalid)`; } }) }),
+  },
+};
+
+const server = new Server({ name: 'mcp-safe-edit', version: '1.0.0' }, { capabilities: { tools: {} } });
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: Object.entries(TOOLS).map(([name, t]) => ({ name, description: t.desc, inputSchema: t.schema })),
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const t = TOOLS[req.params.name];
+  if (!t) return fail(`unknown tool: ${req.params.name}`);
+  try {
+    return ok(t.fn(req.params.arguments || {}));
+  } catch (e) {
+    // Errors are the product here. They carry the diagnosis, and they always
+    // mean nothing was written.
+    return fail(e.message, e instanceof EditError ? e.detail : undefined);
+  }
+});
+
+await server.connect(new StdioServerTransport());
+console.error(`[safe-edit] connected. roots=${roots.join(', ')}`);

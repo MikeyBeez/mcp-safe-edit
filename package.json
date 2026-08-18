@@ -1,0 +1,14 @@
+{
+  "name": "mcp-safe-edit",
+  "version": "1.0.0",
+  "description": "Deterministic file editing for MCP: compare-and-swap on content hash, exact match counting, all-or-nothing batches, atomic writes verified by re-read",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.15.0"
+  }
+}

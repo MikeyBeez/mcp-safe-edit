@@ -14,8 +14,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { sha256 } from './core.js';
 import { functionTree } from './functions.js';
-import { generateMutants, destructionProbe } from './probe.js';
-import { establishBaseline, classifyProbe } from './runner.js';
+import { generateMutants, destructionProbe, nullProbe } from './probe.js';
+import { establishBaseline, classifyProbe, confirmBaseline } from './runner.js';
 
 // Only ask about functions where the answer means something. A one-line getter
 // that nothing watches is not news; a forty-line dispatcher that nothing watches
@@ -43,6 +43,25 @@ export function functionCoverage(abs, content, runVerification, {
   let runs = 0;
 
   const write = (c) => fs.writeFileSync(abs, c, 'utf8');
+  const run = (c) => runVerification(c, abs);
+
+  // An exclusive lock. Two sweeps on the same file interleave their mutants,
+  // and each then reads the OTHER's breakage as its own being caught - an
+  // adversarial review produced a fabricated 'watched' that way. A stale lock
+  // older than an hour is broken rather than deadlocking forever.
+  const lockPath = `${abs}.safe-edit-lock`;
+  let lockFd = null;
+  try {
+    lockFd = fs.openSync(lockPath, 'wx');
+  } catch {
+    let stale = false;
+    try { stale = (Date.now() - fs.statSync(lockPath).mtimeMs) > 3600000; } catch { stale = true; }
+    if (stale) { try { fs.unlinkSync(lockPath); lockFd = fs.openSync(lockPath, 'wx'); } catch { /* fall through */ } }
+    if (lockFd === null) {
+      return { checkable: false, reason: `another probe sweep is already running on ${abs}. Concurrent sweeps interleave their mutants and each reads the other's breakage as its own, so this one refuses rather than reporting a fabricated result.`, functions: [] };
+    }
+  }
+  const releaseLock = () => { try { fs.closeSync(lockFd); } catch {} try { fs.unlinkSync(lockPath); } catch {} };
 
   const report = { checkable: true, functions: [], runs: 0, skipped: [] };
 
@@ -51,16 +70,32 @@ export function functionCoverage(abs, content, runVerification, {
   const baseline = establishBaseline(runVerification, { samples: baseline_samples });
   report.baseline = baseline;
   if (!baseline.usable) {
+    releaseLock();
     report.checkable = false;
     report.reason = baseline.reason;
     return report;
   }
 
   try {
+    // Does the command check what this file DOES, or merely what its bytes are?
+    // A snapshot, checksum or lint rule objects to garbage without executing a
+    // line, and then every mutant looks caught for the wrong reason.
+    const np = nullProbe(content, ext);
+    if (np) {
+      write(np.content);
+      const npRes = classifyProbe(run(np.content));
+      runs++;
+      report.null_probe = { caught: npRes.caught, note: npRes.note };
+      if (npRes.caught) {
+        report.checkable = false;
+        report.reason = 'the verification FAILS on a change that cannot alter behaviour (a single appended comment), so it is checking the file bytes rather than what the file does. Every mutant would be caught for that reason alone and no coverage claim is possible.';
+        return report;
+      }
+    }
     // Does the verifier touch this file at all? If not, nothing below matters.
-    const d = destructionProbe(content);
+    const d = destructionProbe(content, abs);
     write(d.content);
-    const dRes = classifyProbe(runVerification(d.content));
+    const dRes = classifyProbe(run(d.content));
     runs++;
     if (!dRes.caught) {
       report.checkable = false;
@@ -99,7 +134,7 @@ export function functionCoverage(abs, content, runVerification, {
       for (const mut of mutants) {
         if (runs >= max_runs) break;
         write(mut.content);
-        const c = classifyProbe(runVerification(mut.content));
+        const c = classifyProbe(run(mut.content));
         runs++;
         attempts.push({ rule: mut.rule, line: mut.line, change: `${mut.before} => ${mut.after}`, caught: c.caught, conclusive: c.conclusive, note: c.note });
         if (c.caught) caughtAny = true;
@@ -120,8 +155,9 @@ export function functionCoverage(abs, content, runVerification, {
   } finally {
     write(content);
     const restored = sha256(fs.readFileSync(abs, 'utf8'));
+    releaseLock();
     if (restored !== originalSha) {
-      throw new Error(`COVERAGE PROBE RECOVERY FAILED for ${abs}: expected ${originalSha.slice(0, 12)}…, found ${restored.slice(0, 12)}…. Restore from a backup immediately.`);
+      throw new Error(`COVERAGE PROBE RECOVERY FAILED for ${abs}: expected ${originalSha.slice(0, 12)}, found ${restored.slice(0, 12)}. Restore from a backup immediately.`);
     }
   }
 

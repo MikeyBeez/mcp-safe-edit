@@ -1221,3 +1221,170 @@ describe('TypeScript', () => {
     assert.match(fs.readFileSync(p('svc.ts'), 'utf8'), /toLowerCase/);
   });
 });
+
+describe('the six ways it could lie (found by adversarial review)', () => {
+  beforeEach(() => {
+    fs.writeFileSync(p('lib.js'), 'export function price(a, b) {\n  return a + b;\n}\n');
+  });
+
+  test('a checksum guard that never runs the code cannot make it look watched', async () => {
+    // The suite objects to garbage without executing a line, so the destruction
+    // probe alone reads it as exercising the file. The null probe catches it:
+    // it also objects to an appended comment, which cannot change behaviour.
+    fs.writeFileSync(p('expected.sha'), 'irrelevant');
+    fs.writeFileSync(p('guard.mjs'),
+      'import fs from "node:fs";\n' +
+      'import crypto from "node:crypto";\n' +
+      `const src = fs.readFileSync(${JSON.stringify(p('lib.js'))}, "utf8");\n` +
+      'const h = crypto.createHash("sha256").update(src).digest("hex");\n' +
+      `const want = fs.readFileSync(${JSON.stringify(p('expected.sha'))}, "utf8").trim();\n` +
+      'if (want !== "seed" && h !== want) { console.error("drift"); process.exit(1); }\n');
+    // Seed the expected hash from the current file.
+    const crypto = await import('node:crypto');
+    fs.writeFileSync(p('expected.sha'),
+      crypto.createHash('sha256').update(fs.readFileSync(p('lib.js'), 'utf8')).digest('hex'));
+
+    const r = await ctx.call('safe_function_report', {
+      path: p('lib.js'), verify_command: [process.execPath, p('guard.mjs')], verify_cwd: ctx.root,
+    });
+    assert.equal(r.checkable, false, 'a byte-checking suite must not yield coverage claims');
+    assert.equal(r.null_probe.caught, true);
+    assert.match(r.reason, /cannot alter behaviour|checking the file bytes/);
+    assert.deepEqual(r.functions, []);
+  });
+
+  test('a real suite passes the null probe and still reports coverage', async () => {
+    fs.writeFileSync(p('suite.mjs'), 'import { price } from "./lib.js";\nif (price(2,3) !== 5) process.exit(1);\n');
+    const r = await ctx.call('safe_function_report', {
+      path: p('lib.js'), verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root,
+    });
+    assert.equal(r.checkable, true);
+    assert.equal(r.null_probe.caught, false, 'a behavioural suite ignores an added comment');
+    assert.equal(r.functions[0].status, 'watched');
+  });
+
+  test('two byte-identical files do not share a cached answer', async () => {
+    // A vendored copy nothing imports must not inherit the tested original's
+    // result. The destruction probe used to be a constant string, so every file
+    // in a repo collided.
+    fs.mkdirSync(p('a'), { recursive: true });
+    fs.mkdirSync(p('b'), { recursive: true });
+    const body = 'export function price(a, b) {\n  return a + b;\n}\n';
+    fs.writeFileSync(p('a', 'lib.js'), body);
+    fs.writeFileSync(p('b', 'lib.js'), body);           // byte-identical, imported by nobody
+    fs.writeFileSync(p('suite.mjs'), 'import { price } from "./a/lib.js";\nif (price(2,3) !== 5) process.exit(1);\n');
+    const cmd = [process.execPath, p('suite.mjs')];
+    const scope = 'test-scope-fixed';
+
+    const ra = await ctx.call('safe_function_report', { path: p('a', 'lib.js'), verify_command: cmd, verify_cwd: ctx.root, cache_scope: scope });
+    assert.equal(ra.functions[0].status, 'watched');
+
+    const rb = await ctx.call('safe_function_report', { path: p('b', 'lib.js'), verify_command: cmd, verify_cwd: ctx.root, cache_scope: scope });
+    assert.equal(rb.checkable, false, 'the untested copy must not inherit the tested one\'s answer');
+    assert.match(rb.reason, /does not exercise this file/);
+  });
+
+  test('a suite that degrades as it runs voids the sweep', async () => {
+    // Passes the first few times, fails afterwards. The up-front baseline cannot
+    // see it; comparing the baseline before and after can.
+    fs.writeFileSync(p('runs.txt'), '0');
+    fs.writeFileSync(p('drift.mjs'),
+      'import fs from "node:fs";\n' +
+      `const f = ${JSON.stringify(p('runs.txt'))};\n` +
+      'const n = Number(fs.readFileSync(f, "utf8")) + 1;\n' +
+      'fs.writeFileSync(f, String(n));\n' +
+      'if (n > 3) process.exit(1);\n');
+    const r = await ctx.call('safe_function_report', {
+      path: p('lib.js'), verify_command: [process.execPath, p('drift.mjs')], verify_cwd: ctx.root,
+    });
+    assert.equal(r.checkable, false, 'a suite whose behaviour changes mid-sweep must void the result');
+    assert.deepEqual(r.functions, []);
+  });
+
+  test('allow_removals no longer authorises every same-named symbol', async () => {
+    fs.writeFileSync(p('two.js'),
+      'export class A {\n  handler() { return 1; }\n}\n' +
+      'export class B {\n  handler() { return 2; }\n}\n');
+    const before = fs.readFileSync(p('two.js'), 'utf8');
+    const e = await ctx.err('safe_edit', {
+      path: p('two.js'),
+      edits: [
+        { old: '  handler() { return 1; }\n', new: '' },
+        { old: '  handler() { return 2; }\n', new: '' },
+      ],
+      allow_removals: ['A.handler'],
+    });
+    assert.ok(e, 'a grant for A.handler must not cover B.handler');
+    assert.match(e.error, /B\.handler/);
+    assert.doesNotMatch(e.error.replace(/B\.handler/g, ''), /A\.handler/);
+    assert.equal(fs.readFileSync(p('two.js'), 'utf8'), before);
+  });
+
+  test('a fully-qualified grant still works', async () => {
+    fs.writeFileSync(p('two.js'),
+      'export class A {\n  handler() { return 1; }\n}\n' +
+      'export class B {\n  handler() { return 2; }\n}\n');
+    await ctx.call('safe_edit', {
+      path: p('two.js'),
+      edits: [{ old: '  handler() { return 1; }\n', new: '' }],
+      allow_removals: ['A.handler'],
+    });
+    assert.doesNotMatch(fs.readFileSync(p('two.js'), 'utf8'), /return 1/);
+  });
+
+  test('a backup id cannot escape its directory', async () => {
+    await ctx.call('safe_edit', { path: p('lib.js'), edits: [{ old: 'a + b', new: 'b + a' }] });
+    const e = await ctx.err('safe_restore', {
+      path: p('lib.js'), backup_id: '../../../../../../../../tmp/anything',
+    });
+    assert.ok(e, 'a traversing backup id must be refused');
+    assert.match(e.error, /valid backup id/i);
+  });
+
+  test('a real backup id still restores', async () => {
+    const out = await ctx.call('safe_edit', { path: p('lib.js'), edits: [{ old: 'a + b', new: 'b + a' }] });
+    await ctx.call('safe_restore', { path: p('lib.js'), backup_id: out.backup_id });
+    assert.match(fs.readFileSync(p('lib.js'), 'utf8'), /a \+ b/);
+  });
+});
+
+describe('silent-removal holes closed', () => {
+  test('a key nested inside a JSON array is protected', async () => {
+    fs.writeFileSync(p('cfg.json'), '{"tools":[{"name":"search","handler":"h","schema":"s"}]}');
+    const before = fs.readFileSync(p('cfg.json'), 'utf8');
+    const e = await ctx.err('safe_edit', { path: p('cfg.json'), edits: [{ old: ',"handler":"h"', new: '' }] });
+    assert.ok(e, 'a capability inside an array must not vanish quietly');
+    assert.match(e.error, /tools\.0\.handler/);
+    assert.equal(fs.readFileSync(p('cfg.json'), 'utf8'), before);
+  });
+
+  test('an argv element cannot be silently rewritten away', async () => {
+    fs.writeFileSync(p('cfg.json'), '{"args":["--root","/Users/bard/Code"]}');
+    const e = await ctx.err('safe_edit', { path: p('cfg.json'), edits: [{ old: '"/Users/bard/Code"', new: '"/"' }] });
+    assert.ok(e, 'changing an allowed root in a config is a removal of the old value');
+    assert.match(e.error, /args\.1/);
+  });
+
+  test('a python decorator is part of what the function is', async () => {
+    fs.writeFileSync(p('srv.py'), 'from mcp import mcp\n\n@mcp.tool()\ndef search(q):\n    return q\n');
+    const before = fs.readFileSync(p('srv.py'), 'utf8');
+    const e = await ctx.err('safe_edit', { path: p('srv.py'), edits: [{ old: '@mcp.tool()\n', new: '' }] });
+    assert.ok(e, 'stripping @mcp.tool() unregisters the tool while leaving the function');
+    assert.match(e.error, /decorator:search@mcp\.tool/);
+    assert.equal(fs.readFileSync(p('srv.py'), 'utf8'), before);
+  });
+
+  test('python class attributes are part of the contract', async () => {
+    fs.writeFileSync(p('cfg.py'), 'class Cfg:\n    port: int = 8080\n    token = ""\n');
+    const e = await ctx.err('safe_edit', { path: p('cfg.py'), edits: [{ old: '    port: int = 8080\n', new: '' }] });
+    assert.ok(e, 'a dataclass or pydantic field vanishing is a real loss');
+    assert.match(e.error, /attr:Cfg\.port/);
+  });
+
+  test('adding a decorator or a field is allowed', async () => {
+    fs.writeFileSync(p('srv.py'), 'from mcp import mcp\n\ndef search(q):\n    return q\n');
+    const out = await ctx.call('safe_edit', { path: p('srv.py'), edits: [{ old: 'def search(q):', new: '@mcp.tool()\ndef search(q):' }] });
+    assert.ok(out.structure.added.some((x) => x.includes('decorator:search')));
+    assert.deepEqual(out.structure.removed, []);
+  });
+});

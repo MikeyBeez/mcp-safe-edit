@@ -171,14 +171,30 @@ export function structuralGate(abs, beforeContent, afterContent, allowRemovals =
   // "function:beta" or "beta". Normalise both sides to the bare name and accept
   // any of them — being pedantic about the label would just push people towards
   // switching the gate off.
-  const bare = (x) => String(x).split(':').pop().split('.').pop();
-  const allowedBare = new Set(allowRemovals.map(bare));
-  const declared = (name) => allowRemovals.includes(name) || allowedBare.has(bare(name));
+  // The KIND prefix is optional: a caller should not have to know whether we
+  // call it "export.function:beta" or "function:beta". The dotted PATH is not.
+  //
+  // The first version stripped the path too, so allow_removals:["A.handler"]
+  // silently authorised B.handler as well, and ["handler"] authorised every
+  // handler in the file. An adversarial review demonstrated exactly that. A bare
+  // name is still accepted when it is unambiguous - when exactly one removal
+  // ends with it - because pedantry for its own sake pushes people to switch
+  // the gate off entirely.
+  const dropKind = (x) => (String(x).includes(':') ? String(x).slice(String(x).indexOf(':') + 1) : String(x));
+  const grants = allowRemovals.map(dropKind);
+  const declaredIn = (name, all) => {
+    const full = dropKind(name);
+    if (allowRemovals.includes(name) || grants.includes(full)) return true;
+    const bare = full.split('.').pop();
+    if (!grants.includes(bare)) return false;
+    const sameBare = all.filter((n) => dropKind(n).split('.').pop() === bare);
+    return sameBare.length === 1;
+  };
 
   // A nested function vanishing is just as much a loss as an export vanishing,
   // and nothing at the exports level would have caught it.
   if (fnDelta) {
-    const lostFns = fnDelta.removed.filter((n) => !declared(n));
+    const lostFns = fnDelta.removed.filter((n) => !declaredIn(n, fnDelta.removed));
     if (lostFns.length) {
       throw new EditError(
         `Refused: the edit would remove ${lostFns.length} function${lostFns.length === 1 ? '' : 's'} this file defines — ${lostFns.join(', ')}. ` +
@@ -188,7 +204,7 @@ export function structuralGate(abs, beforeContent, afterContent, allowRemovals =
     }
   }
 
-  const undeclared = cmp.removed.filter((sym) => !declared(sym));
+  const undeclared = cmp.removed.filter((sym) => !declaredIn(sym, cmp.removed));
   if (undeclared.length) {
     throw new EditError(
       `Refused: the edit would remove ${undeclared.length} thing${undeclared.length === 1 ? '' : 's'} this file provides — ${undeclared.join(', ')}. ` +

@@ -65,21 +65,27 @@ export const passedOf = (r) => r.outcome === 'passed';
 // hash - asserting what it is that has not changed. If you cannot name it, you
 // do not get to cache it.
 const CACHE_DIR = process.env.SAFE_EDIT_CACHE || path.join(BACKUP_ROOT, '..', 'probe-cache');
-const keyOf = (scope, content, command, cwd) =>
-  crypto.createHash('sha256').update(`${scope} ${content} ${JSON.stringify(command)} ${cwd || ''}`).digest('hex');
+// The key must include WHICH FILE the content belongs to. Two byte-identical
+// files - a vendored copy, a monorepo duplicate, a generated stub - are not
+// interchangeable: one may be exercised by the suite and the other not. An
+// adversarial review proved this: probing a tested file then a byte-identical
+// untested copy returned 4 cache hits, 0 runs, and reported the untested copy
+// as fully watched.
+const keyOf = (scope, target, content, command, cwd) =>
+  crypto.createHash('sha256').update(`${scope}\u0000${target}\u0000${content}\u0000${JSON.stringify(command)}\u0000${cwd || ''}`).digest('hex');
 
 export function makeRunner(command, cwd, timeoutMs = 120000, { cache_scope = null } = {}) {
   let hits = 0, misses = 0;
   const memo = new Map();
 
-  const run = (content) => {
+  const run = (content, target = '') => {
     if (content === undefined) { misses++; return runOnce(command, cwd, timeoutMs); }
-    const memoKey = keyOf('memo', content, command, cwd);
+    const memoKey = keyOf('memo', target, content, command, cwd);
     if (memo.has(memoKey)) { hits++; return { ...memo.get(memoKey), cached: 'memory' }; }
 
     let onDisk = null;
     if (cache_scope) {
-      try { onDisk = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, `${keyOf(cache_scope, content, command, cwd)}.json`), 'utf8')); }
+      try { onDisk = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, `${keyOf(cache_scope, target, content, command, cwd)}.json`), 'utf8')); }
       catch { /* miss */ }
     }
     if (onDisk) { hits++; memo.set(memoKey, onDisk); return { ...onDisk, cached: 'disk' }; }
@@ -93,7 +99,7 @@ export function makeRunner(command, cwd, timeoutMs = 120000, { cache_scope = nul
       if (cache_scope) {
         try {
           fs.mkdirSync(CACHE_DIR, { recursive: true });
-          fs.writeFileSync(path.join(CACHE_DIR, `${keyOf(cache_scope, content, command, cwd)}.json`), JSON.stringify(r));
+          fs.writeFileSync(path.join(CACHE_DIR, `${keyOf(cache_scope, target, content, command, cwd)}.json`), JSON.stringify(r));
         } catch { /* best effort */ }
       }
     }
@@ -137,6 +143,22 @@ export function establishBaseline(runner, { samples = 3 } = {}) {
       return { ...base, usable: true, status: 'green',
         reason: `Green and stable across ${runs.length} runs (median ${median}ms).` };
   }
+}
+
+// Re-run the baseline AFTER a sweep and compare. establishBaseline samples
+// before any probing, which cannot see a suite that degrades as it runs - one
+// that leaves an artefact behind, or fails from the fourth invocation onward.
+// An adversarial review beat the three-sample check exactly that way. If the
+// baseline is not the same at the end as at the start, the sweep is void.
+export function confirmBaseline(runner, before, { samples = 2 } = {}) {
+  const after = establishBaseline(runner, { samples });
+  const stable = after.status === before.status;
+  return {
+    stable, before: before.status, after: after.status,
+    reason: stable
+      ? `The verification behaved the same before and after the sweep (${before.status}).`
+      : `VOID: the verification was ${before.status} before the sweep and ${after.status} after it. Something about running it changed its behaviour, so every result in this sweep is unreliable.`,
+  };
 }
 
 // Given a probe result, decide honestly what happened.

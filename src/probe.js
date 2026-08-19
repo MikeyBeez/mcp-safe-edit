@@ -109,18 +109,59 @@ export function generateMutants(content, lines, max = 4, ext = '.js') {
 // The cheapest, bluntest probe: replace the file with something that cannot
 // possibly work. If the verifier still passes, it does not exercise this file
 // at all, and every finer question is moot.
-export function destructionProbe(content) {
+export function destructionProbe(content, abs = '') {
+  // The content includes the file's own path. Two byte-identical files in a
+  // repo (a vendored copy, a monorepo duplicate) previously produced an
+  // identical destruction probe, so a cache keyed on content served one file's
+  // answer for the other. Found by an adversarial review, not by me.
   return {
     rule: 'destruction',
     line: 0,
     before: '(the whole file)',
     after: '(replaced with a syntax error)',
-    content: '((( SAFE-EDIT PROBE: this file was deliberately corrupted to test whether your verify_command notices )))\n',
+    content: `((( SAFE-EDIT PROBE for ${abs}: this file was deliberately corrupted to test whether your verify_command notices )))\n`,
+  };
+}
+
+// The null probe: a change that CANNOT alter behaviour.
+//
+// The destruction probe answers "does the command object to this file being
+// garbage" and I read that as "the command executes this file". It does not.
+// A snapshot test, a checksum guard or a lint rule objects to garbage without
+// ever running a line of it, and then every mutant is "caught" for the wrong
+// reason and every function reports watched. That is the confident direction of
+// error, and an adversarial review produced it three different ways.
+//
+// So: append a comment. Nothing about the program changes. If the verification
+// FAILS on that, it is checking the file's bytes rather than its behaviour, and
+// no coverage claim below it means anything.
+const COMMENT_SYNTAX = {
+  '.py': '#', '.rb': '#', '.sh': '#', '.yml': '#', '.yaml': '#',
+  '.js': '//', '.mjs': '//', '.cjs': '//', '.ts': '//', '.tsx': '//',
+  '.go': '//', '.rs': '//', '.java': '//', '.c': '//', '.h': '//', '.cpp': '//',
+};
+
+export function nullProbe(content, ext) {
+  const marker = COMMENT_SYNTAX[ext];
+  if (!marker) return null; // no comment syntax we trust: skip rather than guess
+  return {
+    rule: 'null',
+    line: 0,
+    before: '(unchanged)',
+    after: '(one comment line appended)',
+    content: content + `${marker} safe-edit null probe: this comment changes nothing\n`,
   };
 }
 
 // Interpret the results the way they should be read.
-export function summarise(destroyed, survivors, ran) {
+export function summarise(destroyed, survivors, ran, nullProbeCaught = false) {
+  if (nullProbeCaught) {
+    return {
+      trustworthy: false,
+      confidence: 'none',
+      verdict: 'Your verify_command FAILED on a change that cannot alter behaviour - a single appended comment. It is checking the file\'s bytes, not what the file does (a snapshot, checksum or lint rule). Every mutant would be "caught" for that reason alone, so no coverage claim can be made.',
+    };
+  }
   if (destroyed === 'survived') {
     return {
       trustworthy: false,
@@ -134,8 +175,8 @@ export function summarise(destroyed, survivors, ran) {
   if (survivors.length === 0) {
     return {
       trustworthy: true,
-      confidence: ran === 1 ? 'low' : 'reasonable',
-      verdict: `Your verify_command caught every one of the ${ran} deliberate breakages, so its pass on the real edit is informative.`,
+      confidence: ran <= 2 ? 'low' : 'reasonable',
+      verdict: `Your verify_command caught every one of the ${ran} deliberate breakages and ignored a no-op change, so its pass on the real edit is informative.`,
     };
   }
   return {

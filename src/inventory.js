@@ -130,21 +130,37 @@ try:
 except SyntaxError as e:
     print(json.dumps({"parse_error": f"line {e.lineno}: {e.msg}"})); sys.exit(0)
 symbols, imports = [], []
+def _dec_name(d):
+    n = d.func if isinstance(d, ast.Call) else d
+    parts = []
+    while isinstance(n, ast.Attribute):
+        parts.append(n.attr); n = n.value
+    if isinstance(n, ast.Name): parts.append(n.id)
+    return ".".join(reversed(parts)) or "<expr>"
 def walk(node, prefix=""):
     for child in ast.iter_child_nodes(node):
         if isinstance(child, ast.FunctionDef) or isinstance(child, ast.AsyncFunctionDef):
             symbols.append(("method:" if prefix else "function:") + prefix + child.name)
+            # A decorator is not decoration. @mcp.tool() IS the registration, and
+            # stripping it removes the tool while leaving the function present.
+            for d in child.decorator_list:
+                symbols.append("decorator:" + prefix + child.name + "@" + _dec_name(d))
             walk(child, prefix + child.name + ".")
         elif isinstance(child, ast.ClassDef):
             symbols.append("class:" + prefix + child.name)
+            for d in child.decorator_list:
+                symbols.append("decorator:" + prefix + child.name + "@" + _dec_name(d))
             walk(child, prefix + child.name + ".")
         elif isinstance(child, ast.Import):
             for a in child.names: imports.append(a.name)
         elif isinstance(child, ast.ImportFrom):
             imports.append(child.module or ".")
-        elif isinstance(child, ast.Assign) and not prefix:
+        elif isinstance(child, ast.Assign):
             for t in child.targets:
-                if isinstance(t, ast.Name): symbols.append("const:" + t.id)
+                if isinstance(t, ast.Name):
+                    symbols.append(("attr:" + prefix + t.id) if prefix else ("const:" + t.id))
+        elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+            symbols.append(("attr:" + prefix + child.target.id) if prefix else ("const:" + child.target.id))
         else:
             if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 walk(child, prefix)
@@ -179,11 +195,20 @@ function jsonInventory(content) {
   try { obj = JSON.parse(content); }
   catch (e) { const err = new Error(`does not parse as JSON: ${e.message}`); err.parseError = true; throw err; }
   const symbols = [];
+  // Arrays used to be recorded as a length only, so an object nested inside one
+  // could be emptied out and the gate reported a clean, removal-free edit. In an
+  // MCP config the servers live inside arrays, so this mattered. Elements are
+  // indexed by POSITION, which means reordering shows as a change - that is the
+  // right default for an args array, where order is meaning.
   const walk = (v, prefix) => {
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
+    if (Array.isArray(v)) {
+      symbols.push(`array:${prefix.replace(/\.$/, '')}[${v.length}]`);
+      v.forEach((el, i) => walk(el, `${prefix}${i}.`));
+    } else if (v && typeof v === 'object') {
       for (const k of Object.keys(v)) { symbols.push(`key:${prefix}${k}`); walk(v[k], `${prefix}${k}.`); }
-    } else if (Array.isArray(v)) {
-      symbols.push(`array:${prefix.slice(0, -1)}[${v.length}]`);
+    } else if (prefix) {
+      // Leaf values inside arrays carry meaning positionally (a command's argv).
+      symbols.push(`value:${prefix.replace(/\.$/, '')}=${JSON.stringify(v).slice(0, 60)}`);
     }
   };
   walk(obj, '');

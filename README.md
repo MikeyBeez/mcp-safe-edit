@@ -217,6 +217,49 @@ not get to cache it.** A probe depends on every file in the repo, not just the
 one being probed, so the default is memoisation within a single sweep and a disk
 cache requires an explicit `cache_scope` — a git SHA, a lockfile hash.
 
+## Known limits
+
+Written down because a tool that implies a guarantee it does not have is the
+thing this project exists to stop. An adversarial review of three independent
+attackers produced all of these; each is either fixed or listed here.
+
+**Coverage is one-sided.** `UNWATCHED` is reliable - every attack that tried to
+fake it failed. `watched` was fakeable four different ways and each is now
+blocked (see below), but treat a positive coverage claim as weaker evidence
+than a negative one. Absence of coverage is proven; presence of coverage is
+inferred.
+
+**`verify_command` is arbitrary code execution.** It has to be - tests are
+arbitrary code - but it means the containment guarantee covers file operations
+only. `["/bin/sh","-c","..."]` runs anything you can run. Do not pass a command
+you would not run yourself.
+
+**Hardlinks defeat containment.** `realpath` cannot see them: a hardlink inside
+an allowed root to a file outside it is genuinely inside the root by every test
+the filesystem offers. Symlinks, `..` and prefix tricks are all blocked.
+
+**The structural gate protects named things, not shapes.** Covered: functions,
+classes, methods, nested functions, top-level bindings, exports, JSON keys and
+array elements, Python decorators and class attributes, TS interfaces and type
+aliases by name. NOT covered: interface and enum MEMBERS, TS overload
+signatures, function signatures in any language, generics, and
+`Object.assign(module.exports, {...})`. Restated: if deleting it removes a name,
+you are covered; if it removes a member of a type or a parameter, you are not.
+
+**Fixed, with regression tests, after the review:**
+
+- the probe cache omitted file identity, so a byte-identical untested copy
+  inherited a tested file's result - four cache hits, zero runs, fully "watched"
+- a checksum or snapshot suite objected to garbage without executing a line, so
+  every mutant looked caught. A **null probe** - appending one comment, which
+  cannot change behaviour - now detects a suite that checks bytes instead
+- a suite that degraded as it ran passed the up-front baseline; the baseline is
+  now re-run after the sweep and a change voids the whole result
+- two concurrent sweeps interleaved their mutants and each read the other's
+  breakage as its own; sweeps now take an exclusive lock
+- `allow_removals: ["A.handler"]` silently authorised `B.handler` too
+- `backup_id` was pasted into a path, so `../../..` read files outside every root
+
 ## Tools
 
     safe_read            read a file, get its sha256 token
@@ -250,5 +293,5 @@ codebase, about an hour before this server was written.
 
     npm test
 
-119 assertions, no todos. They run the real server over stdio against a
+132 assertions, no todos. They run the real server over stdio against a
 throwaway sandbox — nothing is stubbed.

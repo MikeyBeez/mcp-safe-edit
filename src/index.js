@@ -61,6 +61,9 @@ const TOOLS = {
       verify_command: { type: 'array', items: { type: 'string' }, description: 'Argv array proving the file still works, e.g. ["npm","test"]. Run after the write, never through a shell. If it fails, the file is rolled back.' },
       verify_cwd: { type: 'string', description: 'Where to run verify_command. Defaults to the edited file\'s directory.' },
       verify_timeout_ms: num,
+      verify_the_verifier: { type: 'boolean', description: 'Default true. After verify_command passes, break the file on purpose and confirm the command notices. A command that passes on a corrupted file proves nothing.' },
+      max_probes: { type: 'number', description: 'How many deliberate breakages to try. Default 3: total destruction first, then targeted changes inside the edited lines. Each costs one run of verify_command.' },
+      require_trustworthy_verification: { type: 'boolean', description: 'Default false. When true, an edit whose verification proved uninformative is rolled back rather than merely reported.' },
     }, ['path', 'edits']),
     fn: (a) => editFile(assertAllowed(a.path), {
       ...a,

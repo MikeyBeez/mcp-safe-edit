@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { inventory, compareInventories } from './inventory.js';
+import { changedLines, generateMutants, destructionProbe, summarise } from './probe.js';
 import {
   sha256, readFile, findAll, lineOf, replaceAt, diagnoseMiss,
   atomicWrite, backup, diff,
@@ -197,7 +198,66 @@ const tail = (s, n = 4000) => {
   return t.length > n ? '…' + t.slice(-n) : t;
 };
 
-export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp, check_structure = true, allow_removals = [], verify_command, verify_cwd, verify_timeout_ms }) {
+// ---------------------------------------------------------------------------
+// Verifying the verifier
+// ---------------------------------------------------------------------------
+//
+// A passing test is only as meaningful as the test's ability to fail. So after
+// verify_command passes, we break the file on purpose and check the command
+// notices. Cheapest probe first: if replacing the file with garbage does not
+// fail the command, the command never touches this file and nothing finer is
+// worth measuring.
+//
+// Every probe restores the real content in a finally block, and the restoration
+// is confirmed by hash before returning. A probe must never be able to leave the
+// file in a mutated state.
+
+export function probeVerifier(abs, finalContent, beforeContent, command, cwd, timeoutMs, maxProbes = 3) {
+  const finalSha = sha256(finalContent);
+  const results = [];
+  let destroyed = null;
+
+  const runOn = (content) => {
+    fs.writeFileSync(abs, content, 'utf8');
+    return runVerification(command, cwd, timeoutMs);
+  };
+
+  try {
+    // Probe 0 — total destruction.
+    const d = destructionProbe(finalContent);
+    const dRes = runOn(d.content);
+    destroyed = dRes.passed ? 'survived' : 'caught';
+    results.push({ ...stripContent(d), caught: !dRes.passed, exit_code: dRes.exit_code });
+
+    if (destroyed === 'caught') {
+      const ext = path.extname(abs).toLowerCase();
+      const lines = changedLines(beforeContent, finalContent);
+      const mutants = generateMutants(finalContent, lines, Math.max(0, maxProbes - 1), ext);
+      for (const mut of mutants) {
+        const r = runOn(mut.content);
+        results.push({ ...stripContent(mut), caught: !r.passed, exit_code: r.exit_code });
+      }
+    }
+  } finally {
+    // Always put the real content back, and prove it went back.
+    fs.writeFileSync(abs, finalContent, 'utf8');
+    const restored = sha256(fs.readFileSync(abs, 'utf8'));
+    if (restored !== finalSha) {
+      throw new EditError(
+        `PROBE RECOVERY FAILED: after testing your verify_command the file could not be restored. ` +
+        `Expected ${finalSha.slice(0, 12)}…, found ${restored.slice(0, 12)}…. Restore from the backup immediately.`
+      );
+    }
+  }
+
+  const survivors = results.filter((r) => !r.caught);
+  const ran = results.length;
+  return { ...summarise(destroyed, survivors, ran), probes_run: ran, probes: results, survived: survivors };
+}
+
+const stripContent = ({ content, ...rest }) => rest;
+
+export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp, check_structure = true, allow_removals = [], verify_command, verify_cwd, verify_timeout_ms, verify_the_verifier = true, max_probes = 3, require_trustworthy_verification = false }) {
   if (!Array.isArray(edits) || edits.length === 0) {
     throw new EditError('edits must be a non-empty array');
   }
@@ -260,6 +320,23 @@ export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp, ch
         `Command: ${verify_command.join(' ')} (exit ${v.exit_code}${v.timed_out ? ', timed out' : ''}).`,
         { verification: v, rolled_back: true, backup_id: backupId, structure: result.structure, diff_that_was_reverted: result.diff }
       );
+    }
+
+    // It passed. But is passing informative? Break the file on purpose and see.
+    if (verify_the_verifier && max_probes > 0) {
+      const trust = probeVerifier(abs, after, before.content, verify_command, cwd, verify_timeout_ms, max_probes);
+      result.verification_trust = trust;
+
+      if (trust.trustworthy === false && require_trustworthy_verification) {
+        atomicWrite(abs, before.content);
+        result.rolled_back = true;
+        result.sha256_after = before.sha256;
+        throw new EditError(
+          `ROLLED BACK. Your verification passed, but it also passed on deliberately broken versions of this file, ` +
+          `so its green result proves nothing about this edit. ${trust.verdict}`,
+          { verification: v, verification_trust: trust, rolled_back: true, backup_id: backupId, diff_that_was_reverted: result.diff }
+        );
+      }
     }
   }
   return result;

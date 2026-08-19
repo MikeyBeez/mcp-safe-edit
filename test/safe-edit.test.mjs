@@ -623,3 +623,120 @@ describe('the behavioural gate', () => {
     assert.match(e.error, /Access denied/);
   });
 });
+
+describe('verifying the verifier', () => {
+  beforeEach(() => {
+    fs.writeFileSync(p('lib.js'), 'export function add(a, b){ return a + b; }\n');
+  });
+
+  test('a real test catches every deliberate breakage, so its pass is informative', async () => {
+    fs.writeFileSync(p('good.mjs'),
+      'import { add } from "./lib.js";\n' +
+      'if (add(2, 3) !== 5) { console.error("wrong"); process.exit(1); }\n' +
+      'if (add(0, 0) !== 0) { console.error("wrong"); process.exit(1); }\n');
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_command: [process.execPath, p('good.mjs')],
+      verify_cwd: ctx.root,
+    });
+    assert.equal(out.verification.passed, true);
+    assert.equal(out.verification_trust.trustworthy, true);
+    assert.equal(out.verification_trust.survived.length, 0);
+    assert.ok(out.verification_trust.probes_run >= 2);
+  });
+
+  test('a test that never touches the file is exposed as proving nothing', async () => {
+    fs.writeFileSync(p('blind.mjs'), 'console.log("I never import the file under edit");\n');
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_command: [process.execPath, p('blind.mjs')],
+      verify_cwd: ctx.root,
+    });
+    assert.equal(out.verification.passed, true, 'the command itself passes');
+    assert.equal(out.verification_trust.trustworthy, false);
+    assert.equal(out.verification_trust.confidence, 'none');
+    assert.match(out.verification_trust.verdict, /replaced with garbage|does not exercise this file/);
+  });
+
+  test('THE MOTIVATING BUG: an assertion that cannot tell + from * is caught', async () => {
+    // add(2,2) === 4 is true for both addition and multiplication. The file IS
+    // loaded, so destruction is caught, and the '-' mutant is caught too
+    // (2-2 is 0). Only the '*' mutant slips through — which is precisely the
+    // blindness that let the original bug ship. max_probes is raised so both
+    // arithmetic mutants get a run.
+    fs.writeFileSync(p('weak.mjs'),
+      'import { add } from "./lib.js";\n' +
+      'if (add(2, 2) !== 4) { console.error("wrong"); process.exit(1); }\n');
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_command: [process.execPath, p('weak.mjs')],
+      verify_cwd: ctx.root,
+      max_probes: 6,
+    });
+    assert.equal(out.verification.passed, true);
+    assert.equal(out.verification_trust.trustworthy, false);
+    assert.equal(out.verification_trust.confidence, 'partial');
+    const arith = out.verification_trust.survived.find((s) => s.rule === 'arithmetic' && /\*/.test(s.after));
+    assert.ok(arith, 'the + to * mutant must survive a test that only checks add(2,2)');
+    assert.match(out.verification_trust.verdict, /MISSED/);
+  });
+
+  test('the file is left exactly as the edit intended after probing', async () => {
+    fs.writeFileSync(p('weak.mjs'), 'import { add } from "./lib.js";\nif (add(2,2) !== 4) process.exit(1);\n');
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_command: [process.execPath, p('weak.mjs')],
+      verify_cwd: ctx.root,
+    });
+    assert.equal(fs.readFileSync(p('lib.js'), 'utf8'), 'export function add(a, b){ return b + a; }\n',
+      'probing must not leave a mutant behind');
+    const check = await ctx.call('safe_verify', { path: p('lib.js'), expect_sha256: out.sha256_after });
+    assert.equal(check.matches, true, 'the reported hash must match what is on disk after probing');
+  });
+
+  test('require_trustworthy_verification rolls back an uninformative pass', async () => {
+    const before = fs.readFileSync(p('lib.js'), 'utf8');
+    fs.writeFileSync(p('blind.mjs'), 'console.log("nothing to see");\n');
+    const e = await ctx.err('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_command: [process.execPath, p('blind.mjs')],
+      verify_cwd: ctx.root,
+      require_trustworthy_verification: true,
+    });
+    assert.ok(e);
+    assert.match(e.error, /ROLLED BACK/);
+    assert.match(e.error, /proves nothing/);
+    assert.equal(fs.readFileSync(p('lib.js'), 'utf8'), before);
+  });
+
+  test('probing can be switched off, and the result says so by its absence', async () => {
+    fs.writeFileSync(p('good.mjs'), 'import { add } from "./lib.js";\nif (add(2,3) !== 5) process.exit(1);\n');
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_command: [process.execPath, p('good.mjs')],
+      verify_cwd: ctx.root,
+      verify_the_verifier: false,
+    });
+    assert.equal(out.verification.passed, true);
+    assert.equal(out.verification_trust, undefined);
+  });
+
+  test('each probe is reported with the exact line it changed', async () => {
+    fs.writeFileSync(p('good.mjs'), 'import { add } from "./lib.js";\nif (add(2,3) !== 5) process.exit(1);\n');
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_command: [process.execPath, p('good.mjs')],
+      verify_cwd: ctx.root,
+    });
+    const mutant = out.verification_trust.probes.find((x) => x.rule !== 'destruction');
+    assert.ok(mutant.before && mutant.after && mutant.before !== mutant.after);
+    assert.equal(typeof mutant.line, 'number');
+  });
+});

@@ -85,6 +85,46 @@ Together: the text is what you asked for, the file still provides what it
 provided, and it still passes your own test for working — or it never changed
 at all.
 
+## Verifying the verifier
+
+A passing test is worth exactly as much as that test's ability to fail. So when
+`verify_command` passes, safe-edit does not simply believe it. It breaks the
+file on purpose and checks the command notices.
+
+**Probe 0 — destruction.** Replace the file with a syntax error and run the
+command. If it still passes, it never touches this file, and every finer
+question is moot:
+
+    Your verify_command PASSED on a file that had been replaced with
+    garbage. It does not exercise this file at all, so its green
+    result says nothing about this edit.
+
+**Probes 1..n — targeted mutants.** Small behavioural changes confined to the
+lines this edit touched: `+` to `-` and to `*`, `===` to `!==`, `&&` to `||`,
+`true` to `false`, a numeric literal off by one, a return value nulled. Each
+runs the command once. A mutant that survives means the command loads the file
+but does not check this behaviour, so its pass does not confirm the edit.
+
+Every probe restores the real content in a `finally`, and the restoration is
+confirmed by hash before returning. A probe cannot leave a mutant on disk.
+
+Results are reported, not enforced — a good edit is not punished for a weak
+test suite. Set `require_trustworthy_verification: true` to roll back an edit
+whose verification proved uninformative.
+
+### Why two arithmetic mutants and not one
+
+This feature exists because of a specific bug in this repo's own tests. A test
+sabotaged `add(a,b)` to `a*b` and asserted `add(2, 2) === 4`. Both give 4. The
+verification passed, the rollback never fired, and a broken guarantee reported
+green.
+
+When the probe was first written it swapped `+` for `-` only. That mutant dies
+to `add(2, 2)` — `2 - 2` is `0` — so the probe would have declared that
+assertion sound. It took adding the `*` mutant to reproduce the original
+blindness. One mutant per operator, because a mutant you did not generate is a
+question you did not ask.
+
 ## What can and cannot be checked
 
     .js .mjs .cjs   full parse (acorn) — functions, classes, methods, exports, imports
@@ -131,5 +171,5 @@ codebase, about an hour before this server was written.
 
     npm test
 
-71 assertions, no todos. They run the real server over stdio against a
+78 assertions, no todos. They run the real server over stdio against a
 throwaway sandbox — nothing is stubbed.

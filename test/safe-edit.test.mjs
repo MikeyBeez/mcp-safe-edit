@@ -380,13 +380,14 @@ describe('atomicity', () => {
 });
 
 describe('tool surface', () => {
-  test('advertises the fourteen tools', async () => {
+  test('advertises the seventeen tools', async () => {
     const { tools } = await ctx.client.listTools();
     assert.deepEqual(tools.map((t) => t.name).sort(), [
       'safe_allowed_roots', 'safe_analyzers', 'safe_edit', 'safe_edit_function',
       'safe_function_report', 'safe_functions', 'safe_inventory',
-      'safe_list_backups', 'safe_preview', 'safe_read', 'safe_replace_lines',
-      'safe_restore', 'safe_verify', 'safe_write',
+      'safe_list_backups', 'safe_preview', 'safe_read', 'safe_rebuild_function',
+      'safe_replace_lines', 'safe_restore', 'safe_spec_check',
+      'safe_spec_generate', 'safe_verify', 'safe_write',
     ]);
   });
 
@@ -904,5 +905,155 @@ describe('the per-function verification map', () => {
     });
     assert.equal(r.functions.length, 1);
     assert.equal(r.skipped.length, 1, 'a silently truncated report would be the same lie in a new costume');
+  });
+});
+
+describe('the specification', () => {
+  const SUITE_STRONG =
+    'import { add, mul } from "./calc.js";\n' +
+    'if (add(2, 3) !== 5) { console.error("add wrong"); process.exit(1); }\n' +
+    'if (mul(3, 4) !== 12) { console.error("mul wrong"); process.exit(1); }\n';
+
+  beforeEach(() => {
+    fs.writeFileSync(p('calc.js'),
+      'export function add(a, b) {\n  return a + b;\n}\n\nexport function mul(a, b) {\n  return a * b;\n}\n');
+    fs.writeFileSync(p('suite.mjs'), SUITE_STRONG);
+  });
+
+  const gen = () => ctx.call('safe_spec_generate', {
+    path: p('calc.js'), verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root,
+  });
+  const check = (extra = {}) => ctx.call('safe_spec_check', { path: p('calc.js'), verify_cwd: ctx.root, ...extra });
+
+  test('records both what must pass and what must fail', async () => {
+    const g = await gen();
+    const spec = JSON.parse(fs.readFileSync(p('calc.js.spec.json'), 'utf8'));
+    assert.equal(spec.functions.add.required, true);
+    assert.equal(spec.functions.add.watched, true);
+    assert.ok(spec.functions.add.must_fail.length > 0, 'a falsification must be recorded');
+    assert.ok(g.summary.falsifications_recorded > 0);
+  });
+
+  test('an unchanged file meets its spec', async () => {
+    await gen();
+    const r = await check();
+    assert.equal(r.passed, true, JSON.stringify(r.violations));
+    assert.match(r.verdict, /Meets the spec/);
+  });
+
+  test('a removed function is a violation', async () => {
+    await gen();
+    fs.writeFileSync(p('calc.js'), 'export function add(a, b) {\n  return a + b;\n}\n');
+    const r = await check({ probe: false });
+    assert.equal(r.passed, false);
+    assert.ok(r.violations.some((v) => v.kind === 'function_missing' && v.function === 'mul'));
+  });
+
+  test('THE EROSION CHECK: weakening a test is caught even though everything is green', async () => {
+    await gen();
+    // The code is untouched and the suite still passes — it just stopped
+    // checking mul. Every other gate in this server reports success here.
+    fs.writeFileSync(p('suite.mjs'),
+      'import { add, mul } from "./calc.js";\n' +
+      'if (add(2, 3) !== 5) { console.error("add wrong"); process.exit(1); }\n' +
+      'if (typeof mul !== "function") { process.exit(1); }\n');
+    const stillGreen = await ctx.call('safe_edit', {
+      path: p('calc.js'), edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root,
+      verify_the_verifier: false,
+    });
+    assert.equal(stillGreen.verification.passed, true, 'the suite is green, which is the point');
+
+    const r = await check();
+    assert.equal(r.passed, false, 'the spec must notice that the tests got weaker');
+    const erosion = r.violations.find((v) => v.kind === 'test_erosion');
+    assert.ok(erosion, 'test erosion must be reported');
+    assert.equal(erosion.function, 'mul');
+    assert.match(erosion.detail, /used to fail the verification and now passes/);
+  });
+
+  test('a broken verification is a violation, and probing stops there', async () => {
+    await gen();
+    fs.writeFileSync(p('calc.js'), 'export function add(a, b) {\n  return a - b;\n}\n\nexport function mul(a, b) {\n  return a * b;\n}\n');
+    const r = await check();
+    assert.equal(r.passed, false);
+    assert.ok(r.violations.some((v) => v.kind === 'verification_failed'));
+  });
+
+  test('checking leaves the file byte-identical', async () => {
+    await gen();
+    const before = fs.readFileSync(p('calc.js'), 'utf8');
+    await check();
+    assert.equal(fs.readFileSync(p('calc.js'), 'utf8'), before);
+  });
+
+  test('an unwatched function is recorded as a gap rather than quietly omitted', async () => {
+    fs.writeFileSync(p('suite.mjs'), 'import { add } from "./calc.js";\nif (add(2,3) !== 5) process.exit(1);\n');
+    await gen();
+    const spec = JSON.parse(fs.readFileSync(p('calc.js.spec.json'), 'utf8'));
+    assert.equal(spec.functions.mul.watched, false);
+    assert.match(spec.functions.mul.gap, /nothing in the verification would notice/);
+  });
+});
+
+describe('piece-by-piece rebuild', () => {
+  beforeEach(() => {
+    fs.writeFileSync(p('calc.js'),
+      'export function add(a, b) {\n  return a + b;\n}\n\nexport function mul(a, b) {\n  return a * b;\n}\n');
+    fs.writeFileSync(p('suite.mjs'),
+      'import { add, mul } from "./calc.js";\n' +
+      'if (add(2, 3) !== 5) { console.error("add wrong"); process.exit(1); }\n' +
+      'if (mul(3, 4) !== 12) { console.error("mul wrong"); process.exit(1); }\n');
+  });
+
+  const rebuild = (fn, src, extra = {}) => ctx.call('safe_rebuild_function', {
+    path: p('calc.js'), function_name: fn, new_source: src,
+    verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root, ...extra,
+  });
+
+  test('a rebuilt function that the tests actually check is accepted', async () => {
+    const out = await rebuild('add', 'export function add(a, b) {\n  const total = a + b;\n  return total;\n}');
+    assert.equal(out.rebuilt.watched, true);
+    assert.match(fs.readFileSync(p('calc.js'), 'utf8'), /const total = a \+ b;/);
+  });
+
+  test('a rebuild the tests cannot check is ROLLED BACK even though it passes', async () => {
+    // Nothing watches mul once its assertion is gone. A rebuild that passes is
+    // then merely fitted, not verified.
+    fs.writeFileSync(p('suite.mjs'), 'import { add } from "./calc.js";\nif (add(2,3) !== 5) process.exit(1);\n');
+    const before = fs.readFileSync(p('calc.js'), 'utf8');
+    const e = await ctx.err('safe_rebuild_function', {
+      path: p('calc.js'), function_name: 'mul',
+      new_source: 'export function mul(a, b) {\n  return a * b * 1;\n}',
+      verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root,
+    });
+    assert.ok(e, 'an unverifiable rebuild must not stand');
+    assert.match(e.error, /ROLLED BACK/);
+    assert.match(e.error, /fits the checker|only fits/);
+    assert.equal(fs.readFileSync(p('calc.js'), 'utf8'), before);
+  });
+
+  test('require_watched:false accepts it and says so', async () => {
+    fs.writeFileSync(p('suite.mjs'), 'import { add } from "./calc.js";\nif (add(2,3) !== 5) process.exit(1);\n');
+    const out = await rebuild('mul', 'export function mul(a, b) {\n  return a * b * 1;\n}', { require_watched: false });
+    assert.equal(out.rebuilt.watched, false);
+  });
+
+  test('a rebuild without a verify_command is refused', async () => {
+    const e = await ctx.err('safe_rebuild_function', {
+      path: p('calc.js'), function_name: 'add', new_source: 'export function add(a,b){ return a+b; }',
+    });
+    assert.match(e.error, /requires a verify_command/);
+  });
+
+  test('a rebuild that breaks the tests is rolled back', async () => {
+    const before = fs.readFileSync(p('calc.js'), 'utf8');
+    const e = await ctx.err('safe_rebuild_function', {
+      path: p('calc.js'), function_name: 'add',
+      new_source: 'export function add(a, b) {\n  return a - b;\n}',
+      verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root,
+    });
+    assert.ok(e);
+    assert.equal(fs.readFileSync(p('calc.js'), 'utf8'), before);
   });
 });

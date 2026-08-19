@@ -8,7 +8,8 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { makeGuard, readFile, listBackups, readBackup, backup, atomicWrite, sha256, diff } from './core.js';
-import { editFile, writeFile, replaceLines, editFunction, runVerification, EditError } from './edit.js';
+import { editFile, writeFile, replaceLines, editFunction, rebuildFunction, runVerification, EditError } from './edit.js';
+import { buildSpec, writeSpec, readSpec, checkSpec } from './spec.js';
 import { functionTree } from './functions.js';
 import { functionCoverage } from './coverage.js';
 import { inventory, describeAnalyzers } from './inventory.js';
@@ -155,6 +156,52 @@ const TOOLS = {
       const run = () => runVerification(a.verify_command, cwd, a.verify_timeout_ms);
       return { path: abs, ...functionCoverage(abs, readFile(abs).content, run, a) };
     },
+  },
+  safe_spec_generate: {
+    desc: 'Write a specification for a file: every function it must provide, and for each one the deliberate breakages that MUST fail the verification. Every spec format records what has to pass, which a generator can satisfy by fitting. Recording what has to FAIL cannot be satisfied that way — you cannot make "the suite must fail when this becomes a*b" true by writing a*b.',
+    schema: S({
+      path: str, spec_path: { type: 'string', description: 'Where to write it. Defaults to <file>.spec.json alongside the file.' },
+      verify_command: { type: 'array', items: { type: 'string' } },
+      verify_cwd: str, verify_timeout_ms: num,
+      max_functions: num, max_runs: num, mutants_per_function: num,
+    }, ['path', 'verify_command']),
+    fn: (a) => {
+      const abs = assertAllowed(a.path);
+      const cwd = a.verify_cwd ? assertAllowed(a.verify_cwd) : undefined;
+      const run = () => runVerification(a.verify_command, cwd, a.verify_timeout_ms);
+      const spec = buildSpec(abs, readFile(abs).content, run, { ...a, verify_cwd: cwd, stamp: nowStamp() });
+      const out = assertAllowed(a.spec_path || `${abs}.spec.json`);
+      writeSpec(out, spec);
+      return { spec_path: out, summary: spec.summary, checkable: spec.checkable, reason: spec.reason };
+    },
+  },
+  safe_spec_check: {
+    desc: 'Check a file against its spec. Three questions: is every required function still present, does the verification still pass, and do the recorded breakages still break it. The third catches something nothing else does — a test suite quietly weakening. If a change that used to fail now passes, an assertion was deleted, skipped or loosened, and a full green run will not show it.',
+    schema: S({
+      path: str, spec_path: str, verify_cwd: str, verify_timeout_ms: num,
+      probe: { type: 'boolean', description: 'Default true. False checks presence only, without running anything.' },
+    }, ['path']),
+    fn: (a) => {
+      const abs = assertAllowed(a.path);
+      const specPath = assertAllowed(a.spec_path || `${abs}.spec.json`);
+      const spec = readSpec(specPath);
+      const cwd = a.verify_cwd ? assertAllowed(a.verify_cwd) : (spec.verify_cwd || undefined);
+      const run = () => runVerification(spec.verify_command, cwd, a.verify_timeout_ms);
+      return checkSpec(abs, readFile(abs).content, spec, run, { probe: a.probe !== false });
+    },
+  },
+  safe_rebuild_function: {
+    desc: 'Rebuild one function against the spec, piece by piece. Replaces it, requires the verification to pass, and then breaks the NEW implementation on purpose and requires the verification to notice. An implementation that passes the tests but that no deliberate breakage can disturb has been fitted, not verified — that is rolled back.',
+    schema: S({
+      path: str, function_name: str, new_source: str, expect_sha256: str,
+      verify_command: { type: 'array', items: { type: 'string' } },
+      verify_cwd: str, verify_timeout_ms: num,
+      allow_removals: { type: 'array', items: { type: 'string' } },
+      require_watched: { type: 'boolean', description: 'Default true. False accepts a rebuild the tests cannot check, and says so in the result.' },
+    }, ['path', 'function_name', 'new_source', 'verify_command']),
+    fn: (a) => rebuildFunction(assertAllowed(a.path), {
+      ...a, verify_cwd: a.verify_cwd ? assertAllowed(a.verify_cwd) : undefined, stamp: nowStamp(),
+    }),
   },
   safe_inventory: {
     desc: 'List everything a file provides — functions, classes, methods, exports, imports, JSON key paths, markdown headings. This is the contract safe_edit checks an edit against. Says plainly when a file type cannot be analysed.',

@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { inventory, compareInventories } from './inventory.js';
 import { changedLines, generateMutants, destructionProbe, summarise } from './probe.js';
 import { functionTree, compareTrees } from './functions.js';
+import { functionCoverage } from './coverage.js';
 import {
   sha256, readFile, findAll, lineOf, replaceAt, diagnoseMiss,
   atomicWrite, backup, diff,
@@ -489,4 +490,65 @@ export function editFunction(abs, { function_name, new_source, expect_sha256, dr
     stamp,
     _function: { name: f.name, replaced_lines: [f.start_line, f.end_line] },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Piece-by-piece rebuild
+// ---------------------------------------------------------------------------
+//
+// Rebuilding a whole file against a spec is the dangerous shape: the spec
+// becomes the optimisation target and roughly a third of the time you get
+// something that passes and is wrong. Rebuilding ONE function, gated, is the
+// same idea with a fuse in it.
+//
+// The gate that matters is the last one. After the new implementation passes,
+// we break it on purpose and require the verification to notice. An
+// implementation that passes the tests but that no mutation can perturb
+// detectably has not been verified — it has merely been fitted, and that is the
+// exact failure this whole server exists to make unreachable.
+
+export function rebuildFunction(abs, { function_name, new_source, expect_sha256, verify_command, verify_cwd, verify_timeout_ms, stamp, allow_removals = [], require_watched = true }) {
+  if (!verify_command) {
+    throw new EditError('rebuild requires a verify_command — rebuilding without one is just an edit, and the point of a rebuild is the proof.');
+  }
+  const before = readFile(abs);
+
+  const result = editFunction(abs, {
+    function_name, new_source, expect_sha256, stamp, allow_removals,
+    verify_command, verify_cwd, verify_timeout_ms,
+    verify_the_verifier: false, // the per-function probe below is the stronger check
+  });
+
+  // The anti-fitting gate: is the NEW implementation actually watched?
+  const after = readFile(abs);
+  const cwd = verify_cwd || path.dirname(abs);
+  const run = () => runVerification(verify_command, cwd, verify_timeout_ms);
+  let coverage;
+  try {
+    coverage = functionCoverageFor(abs, after.content, run, function_name);
+  } catch (e) {
+    atomicWrite(abs, before.content);
+    throw new EditError(`Rolled back: could not establish whether the rebuilt ${function_name} is verified — ${e.message}`);
+  }
+
+  result.rebuilt = { function: function_name, watched: coverage.status === 'watched', probe: coverage };
+
+  if (require_watched && coverage.status !== 'watched') {
+    atomicWrite(abs, before.content);
+    result.rolled_back = true;
+    throw new EditError(
+      `ROLLED BACK. The rebuilt ${function_name} passes your verification, but breaking it on purpose ALSO passes — ` +
+      `so the tests do not actually check this implementation. A rebuild that only fits the checker is the failure mode, not the goal. ` +
+      `Either add a test that would catch a wrong ${function_name}, or pass require_watched:false to accept it unverified.`,
+      { rebuilt: result.rebuilt, rolled_back: true, backup_id: result.backup_id }
+    );
+  }
+  return result;
+}
+
+function functionCoverageFor(abs, content, run, name) {
+  const cov = functionCoverage(abs, content, run, { include: [name], max_functions: 1, mutants_per_function: 2, max_runs: 4 });
+  if (cov.checkable === false) return { status: 'UNWATCHED', note: cov.reason };
+  const f = cov.functions[0];
+  return f || { status: 'UNWATCHED', note: 'the function could not be probed' };
 }

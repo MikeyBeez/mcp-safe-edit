@@ -2,3 +2,8 @@ node_modules/
 *.log
 .DS_Store
 *.bak-*
+
+# probe runtime artifacts, never source
+.safe-edit-repo-state.json
+*.safe-edit-lock
+probe-cache/

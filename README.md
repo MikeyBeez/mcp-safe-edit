@@ -129,6 +129,46 @@ and auto-generating hundreds would just mass-produce assertions that cannot
 fail — the disease, not the cure. It is a map of where a test would actually buy
 something.
 
+## The latency switch: how hard to verify
+
+Verifying everything on every edit is correct and unaffordable — each probe is a
+full run of your suite, so a 20-second suite times twenty functions is a
+seven-minute wait to change one line. So `safe_edit` scales the effort to the
+edit, on a ladder you can see and override:
+
+    structural   0 runs   AST gate only. A comment, whitespace, a declared
+                          no-op. Instant.
+    smoke        1 run    Run the suite once, roll back on failure. "Did I
+                          break anything." No probing.
+    changed      1 + k    smoke, then probe only the functions this edit
+                          touched. "...and is my change actually watched."
+    full         1 + n    changed, but probe every function. "Everything."
+
+`verify_effort: auto` (the default) reads the edit and picks: a comment is
+structural, a small change is `changed`, a big or structure-altering change is
+`full`. Pass an explicit level to force one.
+
+And because a long run of small `changed` edits can accumulate an interaction
+bug that only a full pass would catch — function A's edit quietly breaking
+function B — `auto` **escalates to full** once enough small edits, or enough
+time, have passed since the last full check. Cheap by default, thorough on a
+schedule. That is the "test occasionally because of latency" rule, made
+mechanical.
+
+## Watch the unwatched
+
+The most dangerous edit is a change to a function nothing tests: it passes,
+because nothing was ever going to fail. So when an edit lands in a function the
+suite does not actually check — proven by breaking it and watching the suite
+stay green — `safe_edit` returns a loud flag:
+
+    This edit changed `secret`, which your verification does not actually
+    check — a deliberate break there passed the suite. The edit is applied,
+    but it is UNVERIFIED. Write a test for `secret` if this code matters.
+
+It does not refuse the edit. It refuses to let the edit look verified when it is
+not.
+
 ## Verifying the verifier
 
 A passing test is worth exactly as much as that test's ability to fail. So when
@@ -293,5 +333,5 @@ codebase, about an hour before this server was written.
 
     npm test
 
-132 assertions, no todos. They run the real server over stdio against a
+149 assertions, no todos. They run the real server over stdio against a
 throwaway sandbox — nothing is stubbed.

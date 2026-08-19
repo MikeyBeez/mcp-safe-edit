@@ -1503,3 +1503,113 @@ describe('repo scale', () => {
     }
   });
 });
+
+describe('verification effort (the latency switch)', () => {
+  beforeEach(() => {
+    fs.writeFileSync(p('lib.js'),
+      'export function add(a, b) {\n  return a + b;\n}\n\n' +
+      'export function mul(a, b) {\n  return a * b;\n}\n');
+    fs.writeFileSync(p('suite.mjs'),
+      'import { add, mul } from "./lib.js";\n' +
+      'if (add(2, 3) !== 5) process.exit(1);\n' +
+      'if (mul(3, 4) !== 12) process.exit(1);\n');
+  });
+  const V = () => ({ verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root });
+
+  test('a comment-only edit runs no test at all', async () => {
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'), edits: [{ old: 'export function add(a, b) {\n  return a + b;', new: '// a documented sum\nexport function add(a, b) {\n  return a + b;' }],
+      ...V(),
+    });
+    assert.equal(out.verify_effort.level, 'structural');
+    assert.equal(out.verification, undefined, 'structural must not run the suite');
+    assert.match(out.verify_effort.reason, /only comments/);
+  });
+
+  test('a small code edit tests only what changed', async () => {
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'), edits: [{ old: 'return a + b;', new: 'return b + a;' }], ...V(),
+    });
+    assert.equal(out.verify_effort.level, 'changed');
+    assert.equal(out.verification.passed, true);
+    assert.deepEqual(out.verify_effort.touched_functions, ['add']);
+  });
+
+  test('a big edit tests everything', async () => {
+    const bigBody = Array.from({ length: 45 }, (_, i) => `  const x${i} = ${i};`).join('\n');
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'export function mul(a, b) {\n  return a * b;\n}', new: `export function mul(a, b) {\n${bigBody}\n  return a * b;\n}` }],
+      ...V(),
+    });
+    assert.equal(out.verify_effort.level, 'full');
+    assert.ok(out.coverage, 'full effort probes the whole file');
+  });
+
+  test('an explicit level overrides auto', async () => {
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'), edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_effort: 'smoke', ...V(),
+    });
+    assert.equal(out.verify_effort.level, 'smoke');
+    assert.equal(out.verification.passed, true);
+    assert.equal(out.verification_trust, undefined, 'smoke runs the suite but does not probe');
+    assert.equal(out.coverage, undefined);
+  });
+
+  test('structural can be forced, skipping the run entirely', async () => {
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'), edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_effort: 'structural', ...V(),
+    });
+    assert.equal(out.verify_effort.level, 'structural');
+    assert.equal(out.verification, undefined);
+  });
+});
+
+describe('watch the unwatched', () => {
+  beforeEach(() => {
+    // add is tested; secret is not.
+    fs.writeFileSync(p('lib.js'),
+      'export function add(a, b) {\n  return a + b;\n}\n\n' +
+      'export function secret(a, b) {\n  return a - b;\n}\n');
+    fs.writeFileSync(p('suite.mjs'),
+      'import { add } from "./lib.js";\nif (add(2, 3) !== 5) process.exit(1);\n');
+  });
+  const V = () => ({ verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root });
+
+  test('editing an untested function raises a loud unverified flag', async () => {
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'), edits: [{ old: 'return a - b;', new: 'return a - b - 1;' }], ...V(),
+    });
+    assert.ok(out.unwatched_edit, 'an edit to an untested function must be flagged');
+    assert.ok(out.unwatched_edit.functions.includes('secret'));
+    assert.match(out.unwatched_edit.warning, /UNVERIFIED|does not actually check/);
+    // the edit still applied — the flag is a warning, not a refusal
+    assert.match(fs.readFileSync(p('lib.js'), 'utf8'), /return a - b - 1;/);
+  });
+
+  test('editing a tested function raises no such flag', async () => {
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'), edits: [{ old: 'return a + b;', new: 'return b + a;' }], ...V(),
+    });
+    assert.equal(out.unwatched_edit, undefined, 'a watched edit is not flagged');
+  });
+});
+
+describe('occasional escalation', () => {
+  test('the Nth small edit escalates to a full check', async () => {
+    fs.writeFileSync(p('lib.js'), 'export function add(a, b) {\n  return a + b;\n}\n');
+    fs.writeFileSync(p('suite.mjs'), 'import { add } from "./lib.js";\nif (add(2,3) !== 5) process.exit(1);\n');
+    const V = { path: p('lib.js'), verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root };
+    // Flip back and forth so each is a real small edit. Watch for an escalation.
+    let sawEscalation = false;
+    for (let i = 0; i < 12; i++) {
+      const from = i % 2 === 0 ? 'return a + b;' : 'return b + a;';
+      const to = i % 2 === 0 ? 'return b + a;' : 'return a + b;';
+      const out = await ctx.call('safe_edit', { ...V, edits: [{ old: from, new: to }] });
+      if (out.verify_effort.escalated) { sawEscalation = true; break; }
+    }
+    assert.ok(sawEscalation, 'a run of small edits must eventually trigger a full pass');
+  });
+});

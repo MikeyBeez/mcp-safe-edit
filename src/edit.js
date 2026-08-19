@@ -9,6 +9,7 @@ import { changedLines, generateMutants, destructionProbe, summarise } from './pr
 import { functionTree, compareTrees } from './functions.js';
 import { functionCoverage } from './coverage.js';
 import { makeRunner } from './runner.js';
+import { editMetrics, choosePolicy, readVerifyState, writeVerifyState, recordRun } from './policy.js';
 import {
   sha256, readFile, findAll, lineOf, replaceAt, diagnoseMiss,
   atomicWrite, backup, diff,
@@ -311,7 +312,7 @@ export function probeVerifier(abs, finalContent, beforeContent, command, cwd, ti
 
 const stripContent = ({ content, ...rest }) => rest;
 
-export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp, check_structure = true, allow_removals = [], verify_command, verify_cwd, verify_timeout_ms, verify_the_verifier = true, max_probes = 3, require_trustworthy_verification = false }) {
+export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp, check_structure = true, allow_removals = [], verify_command, verify_cwd, verify_timeout_ms, verify_the_verifier = true, max_probes = 3, require_trustworthy_verification = false, verify_effort = 'auto', now = null }) {
   if (!Array.isArray(edits) || edits.length === 0) {
     throw new EditError('edits must be a non-empty array');
   }
@@ -359,28 +360,67 @@ export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp, ch
   result.backup_id = backupId;
   result.verified = true;
 
-  // Gate 2: does it still WORK? Only the caller knows what proves that, so they
-  // name the command. A failure rolls the file back to exactly what it was.
-  if (verify_command) {
-    const cwd = verify_cwd || path.dirname(abs);
-    const v = runVerification(verify_command, cwd, verify_timeout_ms);
-    result.verification = v;
-    if (!v.passed) {
-      atomicWrite(abs, before.content);
-      result.rolled_back = true;
-      result.sha256_after = before.sha256;
-      throw new EditError(
-        `The edit applied but your verification command failed, so the file was ROLLED BACK to its previous content. ` +
-        `Command: ${verify_command.join(' ')} (exit ${v.exit_code}${v.timed_out ? ', timed out' : ''}).`,
-        { verification: v, rolled_back: true, backup_id: backupId, structure: result.structure, diff_that_was_reverted: result.diff }
-      );
-    }
+  // Gate 2: does it still WORK, and how hard should we check?
+  //
+  // Verifying everything on every edit is unaffordable, so the effort scales
+  // with the edit. A comment needs no run; a one-line change needs the suite
+  // plus a probe of the one function it touched; a big or structural change
+  // needs the whole file. And every so often a small edit is escalated to a
+  // full pass, because small edits accumulate interaction risk. See policy.js.
+  const cwd = verify_cwd || path.dirname(abs);
+  const clock = now == null ? nowMillis() : now;
+  const metrics = editMetrics(abs, before.content, after, result.structure);
+  const priorState = readVerifyState(abs);
 
-    // It passed. But is passing informative? Break the file on purpose and see.
-    if (verify_the_verifier && max_probes > 0) {
+  let effort, effortReason, escalated = false;
+  if (verify_effort && verify_effort !== 'auto') {
+    effort = verify_effort;
+    effortReason = 'requested explicitly';
+  } else {
+    const chosen = choosePolicy(metrics, priorState, { now: clock, has_verify_command: !!verify_command });
+    effort = chosen.effort; effortReason = chosen.reason; escalated = !!chosen.escalated;
+  }
+  result.verify_effort = { level: effort, reason: effortReason, escalated, touched_functions: metrics.touched_functions };
+
+  // structural: nothing to run. The AST gate already passed.
+  if (effort === 'structural' || !verify_command) {
+    if (verify_command) writeVerifyState(abs, recordRun(priorState, 'structural', clock));
+    return result;
+  }
+
+  // Every non-structural tier runs the suite once and rolls back on failure.
+  const v = runVerification(verify_command, cwd, verify_timeout_ms);
+  result.verification = v;
+  if (!v.passed) {
+    atomicWrite(abs, before.content);
+    result.rolled_back = true;
+    result.sha256_after = before.sha256;
+    throw new EditError(
+      `The edit applied but your verification command failed, so the file was ROLLED BACK to its previous content. ` +
+      `Command: ${verify_command.join(' ')} (exit ${v.exit_code}${v.timed_out ? ', timed out' : ''}).`,
+      { verification: v, rolled_back: true, backup_id: backupId, structure: result.structure, diff_that_was_reverted: result.diff }
+    );
+  }
+
+  // changed / full: is the pass informative, and is what we CHANGED watched?
+  if (effort !== 'smoke' && verify_the_verifier && max_probes > 0) {
+    if (effort === 'full') {
+      // Probe every function in the file.
+      const runner = makeRunner(verify_command, cwd, verify_timeout_ms);
+      const cov = functionCoverage(abs, after, runner, { mutants_per_function: 1, max_functions: 40, max_runs: 80, baseline_samples: 1 });
+      result.coverage = cov.summary || { note: cov.reason };
+      const unwatched = (cov.functions || []).filter((f) => f.status === 'UNWATCHED').map((f) => f.name);
+      annotateUnwatched(result, unwatched, metrics.touched_functions);
+    } else {
+      // changed: probe the lines this edit touched.
       const trust = probeVerifier(abs, after, before.content, verify_command, cwd, verify_timeout_ms, max_probes);
       result.verification_trust = trust;
-
+      // WATCH THE UNWATCHED. If the deliberate breakage of what we just changed
+      // slips past the suite, the function we edited is not tested - and an edit
+      // to an untested function is the single most dangerous kind. Surface it.
+      if (trust.trustworthy === false && trust.confidence !== 'none') {
+        annotateUnwatched(result, metrics.touched_functions, metrics.touched_functions);
+      }
       if (trust.trustworthy === false && require_trustworthy_verification) {
         atomicWrite(abs, before.content);
         result.rolled_back = true;
@@ -393,7 +433,24 @@ export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp, ch
       }
     }
   }
+
+  writeVerifyState(abs, recordRun(priorState, effort, clock));
   return result;
+}
+
+// now() lives here so tests can pass a fixed clock; the module never calls Date
+// where a test could not control it.
+function nowMillis() { return Date.now(); }
+
+// The loud flag for an edit that landed in a function nothing watches.
+function annotateUnwatched(result, unwatchedNames, touched) {
+  const hit = unwatchedNames.filter((n) => touched.some((t) => t === n || n.endsWith(`.${t}`) || t.endsWith(`.${n}`)));
+  const names = hit.length ? hit : unwatchedNames;
+  if (!names.length) return;
+  result.unwatched_edit = {
+    warning: `This edit changed ${names.join(', ')}, which your verification does not actually check - a deliberate break there passed the suite. The edit is applied, but it is UNVERIFIED. Write a test for ${names[0]} if this code matters.`,
+    functions: names,
+  };
 }
 
 export function writeFile(abs, { content, expect_sha256, create_only = false, stamp }) {

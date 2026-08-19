@@ -6,6 +6,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { inventory, compareInventories } from './inventory.js';
 import { changedLines, generateMutants, destructionProbe, summarise } from './probe.js';
+import { functionTree, compareTrees } from './functions.js';
 import {
   sha256, readFile, findAll, lineOf, replaceAt, diagnoseMiss,
   atomicWrite, backup, diff,
@@ -126,9 +127,23 @@ export function structuralGate(abs, beforeContent, afterContent, allowRemovals =
   const after = inventory(abs, afterContent);
   const cmp = compareInventories(before, after);
 
+  // Function-level delta, including nested functions that an exports-level scan
+  // cannot see. A closure inside a handler is usually where the logic lives.
+  let fnDelta = null;
+  try {
+    const tb = functionTree(abs, beforeContent);
+    const ta = functionTree(abs, afterContent);
+    if (tb.understood && ta.understood && !tb.parse_error && !ta.parse_error) {
+      fnDelta = compareTrees(tb.functions, ta.functions);
+    }
+  } catch { /* the inventory comparison below is the load-bearing check */ }
+
   const report = {
     language: after.language,
     checked: cmp.checkable === true,
+    functions_removed: fnDelta ? fnDelta.removed : null,
+    functions_added: fnDelta ? fnDelta.added : null,
+    functions_kept: fnDelta ? fnDelta.kept.length : null,
     provided_before: before.symbols.length,
     provided_after: after.symbols.length,
     added: cmp.added,
@@ -150,7 +165,28 @@ export function structuralGate(abs, beforeContent, afterContent, allowRemovals =
     );
   }
 
-  const undeclared = cmp.removed.filter((sym) => !allowRemovals.includes(sym) && !allowRemovals.includes(sym.split(':').slice(1).join(':')));
+  // A caller should not have to know whether we call it "export.function:beta",
+  // "function:beta" or "beta". Normalise both sides to the bare name and accept
+  // any of them — being pedantic about the label would just push people towards
+  // switching the gate off.
+  const bare = (x) => String(x).split(':').pop().split('.').pop();
+  const allowedBare = new Set(allowRemovals.map(bare));
+  const declared = (name) => allowRemovals.includes(name) || allowedBare.has(bare(name));
+
+  // A nested function vanishing is just as much a loss as an export vanishing,
+  // and nothing at the exports level would have caught it.
+  if (fnDelta) {
+    const lostFns = fnDelta.removed.filter((n) => !declared(n));
+    if (lostFns.length) {
+      throw new EditError(
+        `Refused: the edit would remove ${lostFns.length} function${lostFns.length === 1 ? '' : 's'} this file defines — ${lostFns.join(', ')}. ` +
+        `Nothing was written. Pass allow_removals with those names if the removal is intended.`,
+        { structure: report, would_remove_functions: lostFns }
+      );
+    }
+  }
+
+  const undeclared = cmp.removed.filter((sym) => !declared(sym));
   if (undeclared.length) {
     throw new EditError(
       `Refused: the edit would remove ${undeclared.length} thing${undeclared.length === 1 ? '' : 's'} this file provides — ${undeclared.join(', ')}. ` +
@@ -403,4 +439,54 @@ export function replaceLines(abs, { start_line, end_line, expect_text, new_text,
   atomicWrite(abs, after);
   result.verified = true;
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Function-addressed editing
+// ---------------------------------------------------------------------------
+//
+// Text matching asks "which occurrence did you mean" and can be wrong. A
+// function has exactly one definition and the parser knows precisely where it
+// starts and ends, so addressing an edit by name removes the ambiguity rather
+// than reporting it. This is the deterministic way to replace a function.
+
+export function editFunction(abs, { function_name, new_source, expect_sha256, dry_run = false, stamp, ...rest }) {
+  const before = readFile(abs);
+  if (expect_sha256 && before.sha256 !== expect_sha256) {
+    throw new EditError(`File changed since you read it. Expected ${expect_sha256.slice(0, 12)}…, found ${before.sha256.slice(0, 12)}….`);
+  }
+  const tree = functionTree(abs, before.content);
+  if (!tree.understood) {
+    throw new EditError(`Cannot address by function in this file: ${tree.reason}. Use safe_edit with exact text instead.`);
+  }
+  if (tree.parse_error) throw new EditError(`The file does not currently parse: ${tree.parse_error}`);
+
+  const matches = tree.functions.filter((f) => f.name === function_name || f.short_name === function_name);
+  if (!matches.length) {
+    throw new EditError(
+      `No function called "${function_name}" in this file. It defines: ${tree.functions.map((f) => f.name).join(', ') || '(none)'}`,
+      { available: tree.functions.map((f) => f.name) }
+    );
+  }
+  if (matches.length > 1) {
+    throw new EditError(
+      `"${function_name}" is ambiguous — ${matches.length} definitions match: ${matches.map((f) => `${f.name} (line ${f.start_line})`).join(', ')}. Use the fully qualified name.`,
+      { candidates: matches.map((f) => f.name) }
+    );
+  }
+
+  const f = matches[0];
+  const lines = before.content.split('\n');
+  const oldSource = lines.slice(f.start_line - 1, f.end_line).join('\n');
+
+  // Reuse the whole safety stack by expressing this as an exact-text edit: the
+  // parser found the text, so the match is guaranteed unique and correct.
+  return editFile(abs, {
+    ...rest,
+    edits: [{ old: oldSource, new: String(new_source), expect_count: 1 }],
+    expect_sha256: before.sha256,
+    dry_run,
+    stamp,
+    _function: { name: f.name, replaced_lines: [f.start_line, f.end_line] },
+  });
 }

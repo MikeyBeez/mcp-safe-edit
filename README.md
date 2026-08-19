@@ -85,6 +85,50 @@ Together: the text is what you asked for, the file still provides what it
 provided, and it still passes your own test for working — or it never changed
 at all.
 
+## The function tree
+
+A file is not a bag of text, it is a set of things it can do. `safe_functions`
+decomposes it into every callable — including the ones nested inside other
+callables, which every exports-level check misses:
+
+    24-24   arrow    noteCall
+    56-69   function remember
+    94-117  function recall
+    105-105   arrow    recall.<anonymous@105>
+   143-154  function forget
+   147-151   arrow    forget.<anonymous@147>
+
+That gives three things the text layer cannot. Presence checking at the
+granularity that matters — deleting `outer.inner` is refused even though no
+export changed. An unambiguous edit address: `safe_edit_function` replaces a
+function by name, because the parser knows exactly where it starts and ends, so
+there is no "which occurrence did you mean". And a unit for mutation probing.
+
+## Which functions is anything watching?
+
+Line coverage tells you a line ran. It does not tell you anyone would notice if
+that line were wrong, which is the only question worth asking.
+`safe_function_report` takes each function in turn, breaks it on purpose, runs
+your verification command, and records whether it complains.
+
+Run against this repo's own brain server with `npm test`:
+
+    watched       recall        24L
+    UNWATCHED     search        15L
+    watched       remember      14L
+    watched       forget        12L
+    UNWATCHED     recent         7L
+    watched       stats          7L
+    UNWATCHED     init           6L
+
+    3 of 12 probed functions are UNWATCHED — you could break them and
+    your verification would still pass.
+
+That is not a demand for a test per function. Most functions do not need one,
+and auto-generating hundreds would just mass-produce assertions that cannot
+fail — the disease, not the cure. It is a map of where a test would actually buy
+something.
+
 ## Verifying the verifier
 
 A passing test is worth exactly as much as that test's ability to fail. So when
@@ -150,6 +194,9 @@ be the same bug one level up.
     safe_read            read a file, get its sha256 token
     safe_inventory       what this file provides — the contract edits are checked against
     safe_analyzers       which file types get a guarantee, and which do not
+    safe_functions       the function tree, including nested functions
+    safe_edit_function   replace one function by name, not by text match
+    safe_function_report which functions your tests would notice breaking
     safe_edit            exact-text edits, counted and verified
     safe_preview         what safe_edit would do, writing nothing
     safe_write           whole-file write; overwriting needs the hash
@@ -171,5 +218,5 @@ codebase, about an hour before this server was written.
 
     npm test
 
-78 assertions, no todos. They run the real server over stdio against a
+92 assertions, no todos. They run the real server over stdio against a
 throwaway sandbox — nothing is stubbed.

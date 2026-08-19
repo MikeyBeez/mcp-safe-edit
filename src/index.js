@@ -8,7 +8,9 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { makeGuard, readFile, listBackups, readBackup, backup, atomicWrite, sha256, diff } from './core.js';
-import { editFile, writeFile, replaceLines, EditError } from './edit.js';
+import { editFile, writeFile, replaceLines, editFunction, runVerification, EditError } from './edit.js';
+import { functionTree } from './functions.js';
+import { functionCoverage } from './coverage.js';
 import { inventory, describeAnalyzers } from './inventory.js';
 
 const roots = process.argv.slice(2);
@@ -113,6 +115,45 @@ const TOOLS = {
         path: abs, restored_from: backup_id, safety_backup_id: safetyId,
         sha256_after: shaAfter, diff: diff(current, restored), verified: true,
       };
+    },
+  },
+  safe_functions: {
+    desc: 'Decompose a file into every callable it defines, including functions nested inside other functions, arrows bound to consts, and methods inside classes — each with its line range, depth and parent. This is the unit edits should be addressed by.',
+    schema: S({ path: str }, ['path']),
+    fn: ({ path: p }) => {
+      const abs = assertAllowed(p);
+      return { path: abs, ...functionTree(abs, readFile(abs).content) };
+    },
+  },
+  safe_edit_function: {
+    desc: 'Replace one whole function by name. The parser finds its exact bounds, so there is no "which occurrence did you mean" — an unknown name lists what the file does define, and an ambiguous one lists the candidates. Passes through the same structural and verification gates as safe_edit.',
+    schema: S({
+      path: str,
+      function_name: { type: 'string', description: 'Bare name, or fully qualified for a nested one, e.g. "outer.inner".' },
+      new_source: { type: 'string', description: 'The complete replacement source for the function, including its signature.' },
+      expect_sha256: str, dry_run: bool,
+      allow_removals: { type: 'array', items: { type: 'string' } },
+      verify_command: { type: 'array', items: { type: 'string' } },
+      verify_cwd: str, verify_timeout_ms: num,
+    }, ['path', 'function_name', 'new_source']),
+    fn: (a) => editFunction(assertAllowed(a.path), {
+      ...a, verify_cwd: a.verify_cwd ? assertAllowed(a.verify_cwd) : undefined, stamp: nowStamp(),
+    }),
+  },
+  safe_function_report: {
+    desc: 'For each function in a file, break it on purpose and see whether your verification command notices. Reports which functions are WATCHED and which are UNWATCHED — the ones you could break with nothing complaining. This is the map of where a test would actually buy you something, as opposed to line coverage, which only says a line ran.',
+    schema: S({
+      path: str,
+      verify_command: { type: 'array', items: { type: 'string' } },
+      verify_cwd: str, verify_timeout_ms: num,
+      mutants_per_function: num, max_functions: num, max_runs: num,
+      include: { type: 'array', items: { type: 'string' }, description: 'Only probe these function names.' },
+    }, ['path', 'verify_command']),
+    fn: (a) => {
+      const abs = assertAllowed(a.path);
+      const cwd = a.verify_cwd ? assertAllowed(a.verify_cwd) : undefined;
+      const run = () => runVerification(a.verify_command, cwd, a.verify_timeout_ms);
+      return { path: abs, ...functionCoverage(abs, readFile(abs).content, run, a) };
     },
   },
   safe_inventory: {

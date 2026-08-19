@@ -380,10 +380,11 @@ describe('atomicity', () => {
 });
 
 describe('tool surface', () => {
-  test('advertises the eleven tools', async () => {
+  test('advertises the fourteen tools', async () => {
     const { tools } = await ctx.client.listTools();
     assert.deepEqual(tools.map((t) => t.name).sort(), [
-      'safe_allowed_roots', 'safe_analyzers', 'safe_edit', 'safe_inventory',
+      'safe_allowed_roots', 'safe_analyzers', 'safe_edit', 'safe_edit_function',
+      'safe_function_report', 'safe_functions', 'safe_inventory',
       'safe_list_backups', 'safe_preview', 'safe_read', 'safe_replace_lines',
       'safe_restore', 'safe_verify', 'safe_write',
     ]);
@@ -463,7 +464,7 @@ describe('the structural gate', () => {
     });
     assert.ok(e, 'removing an exported function must be refused by default');
     assert.match(e.error, /would remove/);
-    assert.match(e.error, /export\.function:beta/);
+    assert.match(e.error, /beta/);
     assert.equal(fs.readFileSync(p('mod.js'), 'utf8'), before, 'the file must be untouched');
   });
 
@@ -738,5 +739,170 @@ describe('verifying the verifier', () => {
     const mutant = out.verification_trust.probes.find((x) => x.rule !== 'destruction');
     assert.ok(mutant.before && mutant.after && mutant.before !== mutant.after);
     assert.equal(typeof mutant.line, 'number');
+  });
+});
+
+describe('the function tree', () => {
+  beforeEach(() => {
+    fs.writeFileSync(p('tree.js'),
+      'export function outer(a) {\n' +
+      '  const helper = (x) => x * 2;\n' +
+      '  function inner(y) {\n' +
+      '    return helper(y);\n' +
+      '  }\n' +
+      '  return inner(a);\n' +
+      '}\n' +
+      'class Thing {\n' +
+      '  go() { return 1; }\n' +
+      '}\n');
+  });
+
+  test('finds functions nested inside other functions', async () => {
+    const t = await ctx.call('safe_functions', { path: p('tree.js') });
+    const names = t.functions.map((f) => f.name);
+    assert.ok(names.includes('outer'));
+    assert.ok(names.includes('outer.inner'), 'a function inside a function must be found');
+    assert.ok(names.includes('outer.helper'), 'an arrow bound to a const inside a function must be found');
+    assert.ok(names.includes('Thing.go'));
+  });
+
+  test('each function carries its line range, depth and parent', async () => {
+    const t = await ctx.call('safe_functions', { path: p('tree.js') });
+    const inner = t.functions.find((f) => f.name === 'outer.inner');
+    assert.equal(inner.start_line, 3);
+    assert.equal(inner.end_line, 5);
+    assert.equal(inner.depth, 1);
+    assert.equal(inner.parent, 'outer');
+  });
+
+  test('deleting a NESTED function is refused, which an exports check would miss', async () => {
+    const before = fs.readFileSync(p('tree.js'), 'utf8');
+    const e = await ctx.err('safe_edit', {
+      path: p('tree.js'),
+      edits: [{ old: '  function inner(y) {\n    return helper(y);\n  }\n', new: '' }],
+    });
+    assert.ok(e, 'a nested function vanishing must be refused');
+    assert.match(e.error, /outer\.inner/);
+    assert.equal(fs.readFileSync(p('tree.js'), 'utf8'), before);
+  });
+
+  test('finds Python functions nested inside methods', async () => {
+    fs.writeFileSync(p('n.py'), 'class R:\n    def go(self):\n        def helper(x):\n            return x\n        return helper(1)\n');
+    const t = await ctx.call('safe_functions', { path: p('n.py') });
+    assert.ok(t.functions.map((f) => f.name).includes('R.go.helper'));
+  });
+});
+
+describe('editing by function name', () => {
+  beforeEach(() => {
+    fs.writeFileSync(p('fn.js'),
+      'export function alpha(a) {\n  return a + 1;\n}\n\nexport function beta(b) {\n  return b + 2;\n}\n');
+  });
+
+  test('replaces a whole function by name', async () => {
+    const out = await ctx.call('safe_edit_function', {
+      path: p('fn.js'), function_name: 'beta',
+      new_source: 'export function beta(b) {\n  return b + 200;\n}',
+    });
+    assert.equal(out.verified, true);
+    assert.match(fs.readFileSync(p('fn.js'), 'utf8'), /return b \+ 200;/);
+    assert.match(fs.readFileSync(p('fn.js'), 'utf8'), /return a \+ 1;/, 'the other function must be untouched');
+  });
+
+  test('an unknown name lists what the file does define', async () => {
+    const e = await ctx.err('safe_edit_function', { path: p('fn.js'), function_name: 'gamma', new_source: 'x' });
+    assert.match(e.error, /No function called "gamma"/);
+    assert.ok(e.available.includes('alpha'));
+    assert.ok(e.available.includes('beta'));
+  });
+
+  test('replacing a function with one of a different name is refused', async () => {
+    const e = await ctx.err('safe_edit_function', {
+      path: p('fn.js'), function_name: 'beta',
+      new_source: 'export function renamed(b) {\n  return b + 2;\n}',
+    });
+    assert.ok(e, 'a rename via replacement silently drops the old name, so it must be declared');
+    assert.match(e.error, /beta/);
+  });
+
+  test('a rename is allowed when declared', async () => {
+    await ctx.call('safe_edit_function', {
+      path: p('fn.js'), function_name: 'beta',
+      new_source: 'export function renamed(b) {\n  return b + 2;\n}',
+      allow_removals: ['beta'],
+    });
+    assert.match(fs.readFileSync(p('fn.js'), 'utf8'), /function renamed/);
+  });
+
+  test('replacement source that does not parse is refused', async () => {
+    const before = fs.readFileSync(p('fn.js'), 'utf8');
+    const e = await ctx.err('safe_edit_function', {
+      path: p('fn.js'), function_name: 'beta', new_source: 'export function beta(b) { return b + ;',
+    });
+    assert.ok(e);
+    assert.equal(fs.readFileSync(p('fn.js'), 'utf8'), before);
+  });
+
+  test('a file type with no parser says so rather than guessing', async () => {
+    fs.writeFileSync(p('x.ts'), 'export function f(a: number) { return a; }\n');
+    const e = await ctx.err('safe_edit_function', { path: p('x.ts'), function_name: 'f', new_source: 'x' });
+    assert.match(e.error, /Cannot address by function/);
+  });
+});
+
+describe('the per-function verification map', () => {
+  beforeEach(() => {
+    fs.writeFileSync(p('two.js'),
+      'export function watched(a, b) {\n  return a + b;\n}\n\nexport function ignored(a, b) {\n  return a - b;\n}\n');
+    // A suite that exercises only one of the two functions.
+    fs.writeFileSync(p('half.mjs'),
+      'import { watched } from "./two.js";\n' +
+      'if (watched(2, 3) !== 5) { console.error("watched is wrong"); process.exit(1); }\n');
+  });
+
+  test('separates the functions a suite watches from the ones it does not', async () => {
+    const r = await ctx.call('safe_function_report', {
+      path: p('two.js'),
+      verify_command: [process.execPath, p('half.mjs')],
+      verify_cwd: ctx.root,
+    });
+    assert.equal(r.checkable, true);
+    const byName = Object.fromEntries(r.functions.map((f) => [f.name, f.status]));
+    assert.equal(byName.watched, 'watched');
+    assert.equal(byName.ignored, 'UNWATCHED');
+    assert.ok(r.summary.unwatched_names.includes('ignored'));
+    assert.match(r.summary.verdict, /UNWATCHED/);
+  });
+
+  test('says plainly when the suite does not exercise the file at all', async () => {
+    fs.writeFileSync(p('blind.mjs'), 'console.log("unrelated");\n');
+    const r = await ctx.call('safe_function_report', {
+      path: p('two.js'),
+      verify_command: [process.execPath, p('blind.mjs')],
+      verify_cwd: ctx.root,
+    });
+    assert.equal(r.checkable, false);
+    assert.match(r.reason, /replaced with garbage|does not exercise this file/);
+  });
+
+  test('the file is byte-identical after the whole report runs', async () => {
+    const before = fs.readFileSync(p('two.js'), 'utf8');
+    await ctx.call('safe_function_report', {
+      path: p('two.js'),
+      verify_command: [process.execPath, p('half.mjs')],
+      verify_cwd: ctx.root,
+    });
+    assert.equal(fs.readFileSync(p('two.js'), 'utf8'), before, 'probing must leave no trace');
+  });
+
+  test('the run budget is respected and what was skipped is named', async () => {
+    const r = await ctx.call('safe_function_report', {
+      path: p('two.js'),
+      verify_command: [process.execPath, p('half.mjs')],
+      verify_cwd: ctx.root,
+      max_functions: 1,
+    });
+    assert.equal(r.functions.length, 1);
+    assert.equal(r.skipped.length, 1, 'a silently truncated report would be the same lie in a new costume');
   });
 });

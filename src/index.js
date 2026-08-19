@@ -11,6 +11,7 @@ import { makeGuard, readFile, listBackups, readBackup, backup, atomicWrite, sha2
 import { editFile, writeFile, replaceLines, editFunction, rebuildFunction, runVerification, EditError } from './edit.js';
 import { buildSpec, writeSpec, readSpec, checkSpec } from './spec.js';
 import { makeRunner, establishBaseline } from './runner.js';
+import { repoReport, discoverSources } from './repo.js';
 import { functionTree } from './functions.js';
 import { functionCoverage } from './coverage.js';
 import { inventory, describeAnalyzers } from './inventory.js';
@@ -157,6 +158,34 @@ const TOOLS = {
       const cwd = a.verify_cwd ? assertAllowed(a.verify_cwd) : undefined;
       const run = makeRunner(a.verify_command, cwd, a.verify_timeout_ms, { cache_scope: a.cache_scope || null });
       return { path: abs, ...functionCoverage(abs, readFile(abs).content, run, a) };
+    },
+  },
+  safe_repo_report: {
+    desc: 'Scan a whole repo and answer the question a single file cannot: where, across everything here, could something break with nothing complaining. Probes each source file in turn, ranks unwatched functions by size, and is incremental - a file whose contents AND whose tests are both unchanged reuses its previous answer. Every file dropped for budget is named, because a silently truncated report reads as if everything had been checked.',
+    schema: S({
+      root: { type: 'string', description: 'Repo root to scan. Source files only; test files are skipped, since they are the thing doing the watching.' },
+      verify_command: { type: 'array', items: { type: 'string' } },
+      verify_cwd: str, verify_timeout_ms: num,
+      max_files: { type: 'number', description: 'How many files to probe this run. Default 60.' },
+      max_runs_total: { type: 'number', description: 'Hard ceiling on verification runs. Default 400.' },
+      max_functions_per_file: num, mutants_per_function: num,
+      time_budget_ms: { type: 'number', description: 'Stop and return after this long, naming what is left. Default 45000, chosen to fit inside a 60-second MCP client timeout. Call again to resume - nothing already measured is repeated.' },
+      incremental: { type: 'boolean', description: 'Default true. Reuses a file result when the file and the tests are both unchanged.' },
+    }, ['root', 'verify_command']),
+    fn: (a) => {
+      const root = assertAllowed(a.root);
+      const cwd = a.verify_cwd ? assertAllowed(a.verify_cwd) : root;
+      const runner = makeRunner(a.verify_command, cwd, a.verify_timeout_ms);
+      return repoReport(root, runner, { ...a, stamp: nowStamp() });
+    },
+  },
+  safe_repo_sources: {
+    desc: 'List the source files a repo scan would probe, without running anything. Cheap way to see the scope and estimate the cost before committing to a sweep.',
+    schema: S({ root: str, max_files: num }, ['root']),
+    fn: (a) => {
+      const root = assertAllowed(a.root);
+      const files = discoverSources(root, { max_files: a.max_files || 500 });
+      return { root, count: files.length, files };
     },
   },
   safe_baseline: {

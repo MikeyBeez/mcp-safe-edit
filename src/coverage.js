@@ -28,6 +28,7 @@ export function functionCoverage(abs, content, runVerification, {
   max_runs = 60,
   include = null,
   baseline_samples = 3,
+  inherited_baseline = null,
 } = {}) {
   const tree = functionTree(abs, content);
   if (!tree.understood) {
@@ -67,7 +68,13 @@ export function functionCoverage(abs, content, runVerification, {
 
   // Nothing below may be believed until the suite is shown green and stable on
   // the unmodified file. A red or flaky baseline makes every mutant look caught.
-  const baseline = establishBaseline(runVerification, { samples: baseline_samples });
+  // baseline_samples: 0 means the CALLER already established a green, stable
+  // baseline for this exact command and passes it in. A repo sweep does that
+  // once instead of once per file; with a 20-second suite, re-establishing it
+  // per file spent the entire time budget before a single probe ran.
+  const baseline = (baseline_samples === 0 && inherited_baseline)
+    ? inherited_baseline
+    : establishBaseline(runVerification, { samples: baseline_samples });
   report.baseline = baseline;
   if (!baseline.usable) {
     releaseLock();
@@ -178,6 +185,20 @@ export function functionCoverage(abs, content, runVerification, {
       ? `Every function probed is watched: a deliberate change to any of them fails your verification.`
       : `${unwatched.length} of ${report.functions.length} probed functions are UNWATCHED — you could break them and your verification would still pass. Largest first: ${unwatched.slice(0, 5).map((f) => `${f.name} (${f.lines} lines)`).join(', ')}.`,
   };
+  // Did running the sweep change how the verification behaves? A suite that
+  // leaves state behind degrades as it is invoked, and the up-front sample
+  // cannot see that. If it moved, every result above is void.
+  if (baseline_samples !== 0) {
+    const drift = confirmBaseline(runVerification, baseline, { samples: 2 });
+    report.baseline_after = drift;
+    if (!drift.stable) {
+      report.checkable = false;
+      report.reason = drift.reason;
+      report.functions = [];
+      return report;
+    }
+  }
+
   if (typeof runVerification.stats === 'function') report.cache = runVerification.stats();
   void lines;
   return report;

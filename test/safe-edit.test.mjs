@@ -380,14 +380,14 @@ describe('atomicity', () => {
 });
 
 describe('tool surface', () => {
-  test('advertises the eighteen tools', async () => {
+  test('advertises the twenty tools', async () => {
     const { tools } = await ctx.client.listTools();
     assert.deepEqual(tools.map((t) => t.name).sort(), [
       'safe_allowed_roots', 'safe_analyzers', 'safe_baseline', 'safe_edit', 'safe_edit_function',
       'safe_function_report', 'safe_functions', 'safe_inventory',
       'safe_list_backups', 'safe_preview', 'safe_read', 'safe_rebuild_function',
-      'safe_replace_lines', 'safe_restore', 'safe_spec_check',
-      'safe_spec_generate', 'safe_verify', 'safe_write',
+      'safe_replace_lines', 'safe_repo_report', 'safe_repo_sources', 'safe_restore',
+      'safe_spec_check', 'safe_spec_generate', 'safe_verify', 'safe_write',
     ]);
   });
 
@@ -1287,18 +1287,33 @@ describe('the six ways it could lie (found by adversarial review)', () => {
   test('a suite that degrades as it runs voids the sweep', async () => {
     // Passes the first few times, fails afterwards. The up-front baseline cannot
     // see it; comparing the baseline before and after can.
+    // The suite must genuinely exercise the file (so the null and destruction
+    // probes behave normally and the sweep runs to completion) AND degrade only
+    // afterwards, so the thing that catches it is the post-sweep drift check
+    // and nothing else.
     fs.writeFileSync(p('runs.txt'), '0');
     fs.writeFileSync(p('drift.mjs'),
       'import fs from "node:fs";\n' +
+      'import { price } from "./lib.js";\n' +
       `const f = ${JSON.stringify(p('runs.txt'))};\n` +
       'const n = Number(fs.readFileSync(f, "utf8")) + 1;\n' +
       'fs.writeFileSync(f, String(n));\n' +
+      'if (price(2, 3) !== 5) process.exit(1);\n' +
       'if (n > 3) process.exit(1);\n');
+    // Budget: baseline(1), null probe(2), one mutant(3) all pass; the
+    // destruction probe does not count because the hoisted import throws
+    // before the counter is written. The post-sweep re-check is run 4.
     const r = await ctx.call('safe_function_report', {
       path: p('lib.js'), verify_command: [process.execPath, p('drift.mjs')], verify_cwd: ctx.root,
+      baseline_samples: 1,   // leave runs for the sweep to reach the failing regime
     });
     assert.equal(r.checkable, false, 'a suite whose behaviour changes mid-sweep must void the result');
     assert.deepEqual(r.functions, []);
+    // Assert WHICH guard fired. The first version of this test passed because
+    // the degrading suite tripped the null probe instead, so it was green while
+    // the drift check it claimed to cover did not exist at all.
+    assert.match(r.reason, /VOID: the verification was/, 'the drift check must be the thing that fired');
+    assert.equal(r.baseline_after.stable, false);
   });
 
   test('allow_removals no longer authorises every same-named symbol', async () => {
@@ -1386,5 +1401,105 @@ describe('silent-removal holes closed', () => {
     const out = await ctx.call('safe_edit', { path: p('srv.py'), edits: [{ old: 'def search(q):', new: '@mcp.tool()\ndef search(q):' }] });
     assert.ok(out.structure.added.some((x) => x.includes('decorator:search')));
     assert.deepEqual(out.structure.removed, []);
+  });
+});
+
+describe('repo scale', () => {
+  beforeEach(() => {
+    for (const e of fs.readdirSync(ctx.root)) fs.rmSync(p(e), { recursive: true, force: true });
+    fs.mkdirSync(p('src'), { recursive: true });
+    fs.mkdirSync(p('test'), { recursive: true });
+    fs.mkdirSync(p('node_modules', 'junk'), { recursive: true });
+    fs.writeFileSync(p('src', 'money.js'), 'export function total(a, b) {\n  return a + b;\n}\n');
+    fs.writeFileSync(p('src', 'lonely.js'), 'export function unused(a, b) {\n  return a * b;\n}\n');
+    fs.writeFileSync(p('node_modules', 'junk', 'x.js'), 'export function junk() { return 1; }\n');
+    fs.writeFileSync(p('test', 'money.test.mjs'),
+      'import { total } from "../src/money.js";\nif (total(2,3) !== 5) process.exit(1);\n');
+    fs.writeFileSync(p('runner.mjs'), `import "./test/money.test.mjs";\n`);
+  });
+
+  const cmd = () => [process.execPath, p('runner.mjs')];
+
+  test('discovery skips node_modules and test files', async () => {
+    const r = await ctx.call('safe_repo_sources', { root: ctx.root });
+    const rel = r.files.map((f) => f.slice(ctx.root.length + 1));
+    assert.ok(rel.includes('src/money.js'));
+    assert.ok(rel.includes('src/lonely.js'));
+    assert.ok(!rel.some((f) => f.includes('node_modules')), 'node_modules must not be probed');
+    assert.ok(!rel.some((f) => f.includes('test/')), 'test files are the watchers, not the watched');
+  });
+
+  test('separates the watched file from the unwatched one', async () => {
+    const r = await ctx.call('safe_repo_report', { root: ctx.root, verify_command: cmd(), verify_cwd: ctx.root });
+    assert.equal(r.checkable, true);
+    const byFile = Object.fromEntries(r.files.map((f) => [f.file.slice(ctx.root.length + 1), f]));
+    assert.equal(byFile['src/money.js'].watched, 1);
+    assert.equal(byFile['src/money.js'].unwatched.length, 0);
+    assert.equal(byFile['src/lonely.js'].checkable, false, 'a file the suite never loads cannot be measured');
+    assert.match(r.summary.verdict, /unwatched|Nothing measured/);
+  });
+
+  test('an unwatched function inside an exercised file is ranked', async () => {
+    fs.writeFileSync(p('src', 'money.js'),
+      'export function total(a, b) {\n  return a + b;\n}\n\n' +
+      'export function discount(a, b) {\n  return a - b;\n}\n');
+    const r = await ctx.call('safe_repo_report', { root: ctx.root, verify_command: cmd(), verify_cwd: ctx.root });
+    assert.ok(r.summary.functions_unwatched >= 1);
+    assert.ok(r.summary.top_unwatched.some((u) => u.name === 'discount'));
+    assert.ok(r.summary.top_unwatched[0].lines >= r.summary.top_unwatched[r.summary.top_unwatched.length - 1].lines,
+      'ranked largest first');
+  });
+
+  test('a red baseline stops the whole sweep with one answer', async () => {
+    fs.writeFileSync(p('runner.mjs'), 'process.exit(1);\n');
+    const r = await ctx.call('safe_repo_report', { root: ctx.root, verify_command: cmd(), verify_cwd: ctx.root });
+    assert.equal(r.checkable, false);
+    assert.equal(r.baseline.status, 'red');
+    assert.deepEqual(r.files, []);
+  });
+
+  test('a second run reuses results and costs no verification runs', async () => {
+    const first = await ctx.call('safe_repo_report', { root: ctx.root, verify_command: cmd(), verify_cwd: ctx.root });
+    assert.ok(first.runs > 0);
+    const second = await ctx.call('safe_repo_report', { root: ctx.root, verify_command: cmd(), verify_cwd: ctx.root });
+    assert.equal(second.runs, 0, 'nothing changed, so nothing should be re-probed');
+    assert.equal(second.reused, first.probed);
+  });
+
+  test('changing a source file re-probes only that file', async () => {
+    await ctx.call('safe_repo_report', { root: ctx.root, verify_command: cmd(), verify_cwd: ctx.root });
+    fs.writeFileSync(p('src', 'money.js'), 'export function total(a, b) {\n  return b + a;\n}\n');
+    const r = await ctx.call('safe_repo_report', { root: ctx.root, verify_command: cmd(), verify_cwd: ctx.root });
+    assert.equal(r.probed, 1, 'only the changed file should be re-probed');
+    assert.ok(r.reused >= 1);
+  });
+
+  test('changing the TESTS invalidates every cached file', async () => {
+    // The reason the fingerprint includes a hash of the tests: a rewritten
+    // suite changes the answer for a file that never moved.
+    const first = await ctx.call('safe_repo_report', { root: ctx.root, verify_command: cmd(), verify_cwd: ctx.root });
+    fs.writeFileSync(p('test', 'money.test.mjs'),
+      'import { total } from "../src/money.js";\nif (typeof total !== "function") process.exit(1);\n');
+    const r = await ctx.call('safe_repo_report', { root: ctx.root, verify_command: cmd(), verify_cwd: ctx.root });
+    assert.equal(r.reused, 0, 'no file result survives a change to the tests');
+    assert.equal(r.probed, first.probed);
+  });
+
+  test('a spent budget names what was dropped', async () => {
+    const r = await ctx.call('safe_repo_report', {
+      root: ctx.root, verify_command: cmd(), verify_cwd: ctx.root, max_files: 1, incremental: false,
+    });
+    assert.equal(r.probed, 1);
+    assert.ok(r.skipped.length >= 1);
+    assert.match(r.skipped[0], /file budget/);
+    assert.equal(r.summary.files_skipped, r.skipped.length);
+  });
+
+  test('every source file is left byte-identical', async () => {
+    const before = fs.readdirSync(p('src')).map((f) => [f, fs.readFileSync(p('src', f), 'utf8')]);
+    await ctx.call('safe_repo_report', { root: ctx.root, verify_command: cmd(), verify_cwd: ctx.root, incremental: false });
+    for (const [f, content] of before) {
+      assert.equal(fs.readFileSync(p('src', f), 'utf8'), content, `${f} must be untouched`);
+    }
   });
 });

@@ -50,9 +50,66 @@ Also detected: CRLF versus LF, tabs versus spaces, and the case where the first
 line of a block matches but the rest does not — which localises the mismatch
 instead of leaving you to bisect it.
 
+## Two gates after the text is right
+
+Getting the text edit right is not the same as leaving the file working. So an
+edit passes through two more gates before it is allowed to stand.
+
+**The structural gate (on by default).** Before writing, the file's inventory is
+taken — every function, class, method, export, import, JSON key path, markdown
+heading. The edit is applied in memory, the inventory is taken again, and
+anything that disappeared is a refusal. Nothing reaches the disk, so there is no
+window where the file is broken.
+
+    Refused: the edit would remove 1 thing this file provides —
+    export.function:beta. Nothing was written. If that removal is
+    intended, pass allow_removals with those names.
+
+Deleting things is allowed — you just have to say so. `allow_removals` turns a
+silent loss into a declared one. An edit that leaves the file unparseable is
+refused outright.
+
+`safe_inventory` shows you the contract for any file.
+
+**The behavioural gate (opt-in).** Structure is not behaviour. Only you know
+what proves a file still works, so you name it:
+
+    verify_command: ["npm", "test"]
+
+It runs after the write. If it fails, **the file is rolled back to exactly what
+it was**, and the error carries the command output and the diff that was
+reverted. It is an argv array executed directly, never a shell string, so
+nothing in it is interpreted.
+
+Together: the text is what you asked for, the file still provides what it
+provided, and it still passes your own test for working — or it never changed
+at all.
+
+## What can and cannot be checked
+
+    .js .mjs .cjs   full parse (acorn) — functions, classes, methods, exports, imports
+    .py             full parse (python ast) — functions, classes, methods, imports
+    .json           every key path
+    .md             headings, plus unbalanced code fences
+
+TypeScript has deliberately **no** analyzer. Parsing `.ts` with a JavaScript
+parser would choke on type annotations and report a healthy file as broken,
+which is worse than admitting the gap. Any unlisted type is edited textually and
+the result says so:
+
+    NO STRUCTURAL GUARANTEE: no structural analyzer for ".ts" files.
+    The text edit was applied exactly as asked, but nothing verified
+    that this file still does what it did.
+
+That sentence is the whole discipline of this server pointed at itself. An
+analyzer that quietly returned "looks fine" for a file it could not parse would
+be the same bug one level up.
+
 ## Tools
 
     safe_read            read a file, get its sha256 token
+    safe_inventory       what this file provides — the contract edits are checked against
+    safe_analyzers       which file types get a guarantee, and which do not
     safe_edit            exact-text edits, counted and verified
     safe_preview         what safe_edit would do, writing nothing
     safe_write           whole-file write; overwriting needs the hash
@@ -74,5 +131,5 @@ codebase, about an hour before this server was written.
 
     npm test
 
-48 assertions, no todos. They run the real server over stdio against a
+71 assertions, no todos. They run the real server over stdio against a
 throwaway sandbox — nothing is stubbed.

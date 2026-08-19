@@ -2,6 +2,9 @@
 // tested directly, and so the server file stays thin enough to read in one go.
 
 import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { inventory, compareInventories } from './inventory.js';
 import {
   sha256, readFile, findAll, lineOf, replaceAt, diagnoseMiss,
   atomicWrite, backup, diff,
@@ -107,7 +110,94 @@ function applyPlan(content, plan) {
   return out;
 }
 
-export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp }) {
+// ---------------------------------------------------------------------------
+// The structural gate
+// ---------------------------------------------------------------------------
+//
+// A textually perfect edit can still gut the file. So before the write lands we
+// take an inventory of what the file provides, take it again on the edited text
+// still held in memory, and refuse if anything vanished that the caller did not
+// declare. Refusing here means nothing was written at all — there is no window
+// where the file is broken on disk.
+
+export function structuralGate(abs, beforeContent, afterContent, allowRemovals = []) {
+  const before = inventory(abs, beforeContent);
+  const after = inventory(abs, afterContent);
+  const cmp = compareInventories(before, after);
+
+  const report = {
+    language: after.language,
+    checked: cmp.checkable === true,
+    provided_before: before.symbols.length,
+    provided_after: after.symbols.length,
+    added: cmp.added,
+    removed: cmp.removed,
+    added_imports: cmp.added_imports,
+    removed_imports: cmp.removed_imports,
+    notes: cmp.notes || [],
+  };
+
+  if (!cmp.checkable) {
+    report.warning = `NO STRUCTURAL GUARANTEE: ${cmp.reason}. The text edit was applied exactly as asked, but nothing verified that this file still does what it did.`;
+    return report;
+  }
+
+  if (cmp.broken) {
+    throw new EditError(
+      `Refused: the edit would leave the file unparseable — ${cmp.broken}. Nothing was written.`,
+      { structure: report }
+    );
+  }
+
+  const undeclared = cmp.removed.filter((sym) => !allowRemovals.includes(sym) && !allowRemovals.includes(sym.split(':').slice(1).join(':')));
+  if (undeclared.length) {
+    throw new EditError(
+      `Refused: the edit would remove ${undeclared.length} thing${undeclared.length === 1 ? '' : 's'} this file provides — ${undeclared.join(', ')}. ` +
+      `Nothing was written. If that removal is intended, pass allow_removals with those names.`,
+      { structure: report, would_remove: undeclared }
+    );
+  }
+
+  const lostImports = cmp.removed_imports.filter((i) => !allowRemovals.includes(i));
+  if (lostImports.length) report.warning = `imports no longer referenced: ${lostImports.join(', ')}`;
+
+  return report;
+}
+
+// ---------------------------------------------------------------------------
+// The behavioural gate
+// ---------------------------------------------------------------------------
+//
+// Structure is not behaviour. If the caller names a command that proves the
+// file still works — a test suite, a linter, a type-check — we run it AFTER the
+// write and roll the file back if it fails. execFile with an argv array, never
+// a shell string, so nothing in the arguments is interpreted.
+
+export function runVerification(command, cwd, timeoutMs = 120000) {
+  if (!Array.isArray(command) || !command.length || command.some((c) => typeof c !== 'string')) {
+    throw new EditError('verify_command must be an array of strings, e.g. ["npm","test"]. It is executed directly, never through a shell.');
+  }
+  const [cmd, ...args] = command;
+  try {
+    const stdout = execFileSync(cmd, args, { cwd, encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'] });
+    return { passed: true, command, exit_code: 0, output: tail(stdout) };
+  } catch (e) {
+    return {
+      passed: false,
+      command,
+      exit_code: e.status === undefined ? null : e.status,
+      timed_out: e.signal === 'SIGTERM' || /ETIMEDOUT/.test(String(e.code)),
+      output: tail(`${e.stdout || ''}${e.stderr || ''}` || e.message),
+    };
+  }
+}
+
+const tail = (s, n = 4000) => {
+  const t = String(s);
+  return t.length > n ? '…' + t.slice(-n) : t;
+};
+
+export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp, check_structure = true, allow_removals = [], verify_command, verify_cwd, verify_timeout_ms }) {
   if (!Array.isArray(edits) || edits.length === 0) {
     throw new EditError('edits must be a non-empty array');
   }
@@ -134,6 +224,14 @@ export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp }) 
     diff: diff(before.content, after),
   };
 
+  // Gate 1: does the file still provide everything it provided before?
+  // Runs on the in-memory result, so a refusal never touches the disk.
+  if (check_structure) {
+    result.structure = structuralGate(abs, before.content, after, allow_removals);
+  } else {
+    result.structure = { checked: false, warning: 'structural checking was switched off for this call' };
+  }
+
   if (dry_run) {
     result.note = 'Nothing was written. Re-send with dry_run:false and expect_sha256 to apply.';
     return result;
@@ -146,6 +244,24 @@ export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp }) 
   }
   result.backup_id = backupId;
   result.verified = true;
+
+  // Gate 2: does it still WORK? Only the caller knows what proves that, so they
+  // name the command. A failure rolls the file back to exactly what it was.
+  if (verify_command) {
+    const cwd = verify_cwd || path.dirname(abs);
+    const v = runVerification(verify_command, cwd, verify_timeout_ms);
+    result.verification = v;
+    if (!v.passed) {
+      atomicWrite(abs, before.content);
+      result.rolled_back = true;
+      result.sha256_after = before.sha256;
+      throw new EditError(
+        `The edit applied but your verification command failed, so the file was ROLLED BACK to its previous content. ` +
+        `Command: ${verify_command.join(' ')} (exit ${v.exit_code}${v.timed_out ? ', timed out' : ''}).`,
+        { verification: v, rolled_back: true, backup_id: backupId, structure: result.structure, diff_that_was_reverted: result.diff }
+      );
+    }
+  }
   return result;
 }
 

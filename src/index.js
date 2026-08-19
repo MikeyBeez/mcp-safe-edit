@@ -9,6 +9,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { makeGuard, readFile, listBackups, readBackup, backup, atomicWrite, sha256, diff } from './core.js';
 import { editFile, writeFile, replaceLines, EditError } from './edit.js';
+import { inventory, describeAnalyzers } from './inventory.js';
 
 const roots = process.argv.slice(2);
 if (!roots.length) {
@@ -49,18 +50,27 @@ const TOOLS = {
     fn: ({ path: p }) => readFile(assertAllowed(p)),
   },
   safe_edit: {
-    desc: 'Apply one or more exact-text edits to a file. Every edit is validated against the original content BEFORE anything is written, so a batch is all-or-nothing. A match count other than the one you asserted is an error. Writes atomically and re-reads the file to prove what landed.',
+    desc: 'Apply one or more exact-text edits to a file. Every edit is validated against the original content BEFORE anything is written, so a batch is all-or-nothing. A match count other than the one you asserted is an error. Then two gates: the file must still provide everything it provided before (functions, classes, exports, JSON keys), and if you name a verify_command it must pass or the file is rolled back. Writes atomically and re-reads to prove what landed.',
     schema: S({
       path: str,
       edits: { type: 'array', items: EDIT_ITEM },
       expect_sha256: { type: 'string', description: 'The sha256 from safe_read. Omit only if you accept editing whatever is currently there.' },
       dry_run: bool,
+      check_structure: { type: 'boolean', description: 'Default true. Refuses the edit if it would remove something the file provides, or leave it unparseable.' },
+      allow_removals: { type: 'array', items: { type: 'string' }, description: 'Names you INTEND to remove, e.g. ["function:oldHelper"] or just ["oldHelper"]. Anything removed that is not listed here is a refusal.' },
+      verify_command: { type: 'array', items: { type: 'string' }, description: 'Argv array proving the file still works, e.g. ["npm","test"]. Run after the write, never through a shell. If it fails, the file is rolled back.' },
+      verify_cwd: { type: 'string', description: 'Where to run verify_command. Defaults to the edited file\'s directory.' },
+      verify_timeout_ms: num,
     }, ['path', 'edits']),
-    fn: (a) => editFile(assertAllowed(a.path), { ...a, stamp: nowStamp() }),
+    fn: (a) => editFile(assertAllowed(a.path), {
+      ...a,
+      verify_cwd: a.verify_cwd ? assertAllowed(a.verify_cwd) : undefined,
+      stamp: nowStamp(),
+    }),
   },
   safe_preview: {
     desc: 'Exactly what safe_edit would do, without writing. Returns the diff and the resulting sha256.',
-    schema: S({ path: str, edits: { type: 'array', items: EDIT_ITEM }, expect_sha256: str }, ['path', 'edits']),
+    schema: S({ path: str, edits: { type: 'array', items: EDIT_ITEM }, expect_sha256: str, check_structure: bool, allow_removals: { type: 'array', items: { type: 'string' } } }, ['path', 'edits']),
     fn: (a) => editFile(assertAllowed(a.path), { ...a, dry_run: true, stamp: nowStamp() }),
   },
   safe_write: {
@@ -101,6 +111,20 @@ const TOOLS = {
         sha256_after: shaAfter, diff: diff(current, restored), verified: true,
       };
     },
+  },
+  safe_inventory: {
+    desc: 'List everything a file provides — functions, classes, methods, exports, imports, JSON key paths, markdown headings. This is the contract safe_edit checks an edit against. Says plainly when a file type cannot be analysed.',
+    schema: S({ path: str }, ['path']),
+    fn: ({ path: p }) => {
+      const abs = assertAllowed(p);
+      const inv = inventory(abs, readFile(abs).content);
+      return { path: abs, ...inv };
+    },
+  },
+  safe_analyzers: {
+    desc: 'Which file types get a structural guarantee, and which do not. Anything unlisted is edited textually with no guarantee, and safe_edit says so in its result rather than implying safety it cannot provide.',
+    schema: S({}),
+    fn: () => describeAnalyzers(),
   },
   safe_allowed_roots: {
     desc: 'List the directories this server is permitted to touch.',

@@ -380,11 +380,12 @@ describe('atomicity', () => {
 });
 
 describe('tool surface', () => {
-  test('advertises the nine tools', async () => {
+  test('advertises the eleven tools', async () => {
     const { tools } = await ctx.client.listTools();
     assert.deepEqual(tools.map((t) => t.name).sort(), [
-      'safe_allowed_roots', 'safe_edit', 'safe_list_backups', 'safe_preview',
-      'safe_read', 'safe_replace_lines', 'safe_restore', 'safe_verify', 'safe_write',
+      'safe_allowed_roots', 'safe_analyzers', 'safe_edit', 'safe_inventory',
+      'safe_list_backups', 'safe_preview', 'safe_read', 'safe_replace_lines',
+      'safe_restore', 'safe_verify', 'safe_write',
     ]);
   });
 
@@ -395,5 +396,230 @@ describe('tool surface', () => {
 
   test('safe_allowed_roots reports the sandbox', async () => {
     assert.deepEqual((await ctx.call('safe_allowed_roots')).roots, [ctx.root]);
+  });
+});
+
+describe('structural inventory', () => {
+  test('lists what a JavaScript file provides', async () => {
+    fs.writeFileSync(p('mod.js'), 'import fs from "node:fs";\nexport function alpha(){ return 1; }\nexport const beta = 2;\nclass Thing { go(){} }\n');
+    const inv = await ctx.call('safe_inventory', { path: p('mod.js') });
+    assert.equal(inv.understood, true);
+    assert.equal(inv.language, 'javascript');
+    assert.ok(inv.symbols.includes('export.function:alpha'));
+    assert.ok(inv.symbols.includes('export.const:beta'));
+    assert.ok(inv.symbols.includes('class:Thing'));
+    assert.ok(inv.symbols.includes('method:Thing.go'));
+    assert.deepEqual(inv.imports, ['node:fs']);
+  });
+
+  test('lists what a Python file provides', async () => {
+    fs.writeFileSync(p('m.py'), 'import os\n\ndef work(x):\n    return x\n\nclass Runner:\n    def start(self):\n        pass\n');
+    const inv = await ctx.call('safe_inventory', { path: p('m.py') });
+    assert.equal(inv.language, 'python');
+    assert.ok(inv.symbols.includes('function:work'));
+    assert.ok(inv.symbols.includes('class:Runner'));
+    assert.ok(inv.symbols.includes('method:Runner.start'));
+  });
+
+  test('lists JSON key paths', async () => {
+    fs.writeFileSync(p('c.json'), '{"mcpServers":{"brain":{"command":"node"}}}');
+    const inv = await ctx.call('safe_inventory', { path: p('c.json') });
+    assert.ok(inv.symbols.includes('key:mcpServers'));
+    assert.ok(inv.symbols.includes('key:mcpServers.brain.command'));
+  });
+
+  test('admits when it cannot analyse a file type', async () => {
+    fs.writeFileSync(p('x.ts'), 'const a: number = 1;\n');
+    const inv = await ctx.call('safe_inventory', { path: p('x.ts') });
+    assert.equal(inv.understood, false);
+    assert.match(inv.reason, /TypeScript/);
+  });
+
+  test('safe_analyzers says which types are covered', async () => {
+    const a = await ctx.call('safe_analyzers');
+    assert.ok(a.supported.some((x) => x.ext === '.js'));
+    assert.ok(a.unsupported.some((x) => x.ext === '.ts'));
+  });
+});
+
+describe('the structural gate', () => {
+  beforeEach(() => {
+    fs.writeFileSync(p('mod.js'),
+      'export function alpha(){ return 1; }\nexport function beta(){ return 2; }\nexport const GAMMA = 3;\n');
+  });
+
+  test('an edit that keeps everything is allowed and reports the check', async () => {
+    const out = await ctx.call('safe_edit', { path: p('mod.js'), edits: [{ old: 'return 1;', new: 'return 11;' }] });
+    assert.equal(out.structure.checked, true);
+    assert.deepEqual(out.structure.removed, []);
+    assert.equal(out.structure.language, 'javascript');
+  });
+
+  test('an edit that deletes a function is REFUSED and nothing is written', async () => {
+    const before = fs.readFileSync(p('mod.js'), 'utf8');
+    const e = await ctx.err('safe_edit', {
+      path: p('mod.js'),
+      edits: [{ old: 'export function beta(){ return 2; }\n', new: '' }],
+    });
+    assert.ok(e, 'removing an exported function must be refused by default');
+    assert.match(e.error, /would remove/);
+    assert.match(e.error, /export\.function:beta/);
+    assert.equal(fs.readFileSync(p('mod.js'), 'utf8'), before, 'the file must be untouched');
+  });
+
+  test('a declared removal is allowed', async () => {
+    await ctx.call('safe_edit', {
+      path: p('mod.js'),
+      edits: [{ old: 'export function beta(){ return 2; }\n', new: '' }],
+      allow_removals: ['export.function:beta'],
+    });
+    assert.doesNotMatch(fs.readFileSync(p('mod.js'), 'utf8'), /beta/);
+  });
+
+  test('a bare name works as a declaration too', async () => {
+    await ctx.call('safe_edit', {
+      path: p('mod.js'),
+      edits: [{ old: 'export function beta(){ return 2; }\n', new: '' }],
+      allow_removals: ['beta'],
+    });
+    assert.doesNotMatch(fs.readFileSync(p('mod.js'), 'utf8'), /beta/);
+  });
+
+  test('an edit that breaks the syntax is REFUSED', async () => {
+    const before = fs.readFileSync(p('mod.js'), 'utf8');
+    const e = await ctx.err('safe_edit', {
+      path: p('mod.js'),
+      edits: [{ old: 'export function alpha(){ return 1; }', new: 'export function alpha({ return 1;' }],
+    });
+    assert.ok(e);
+    assert.match(e.error, /unparseable/);
+    assert.equal(fs.readFileSync(p('mod.js'), 'utf8'), before);
+  });
+
+  test('a broken JSON edit is REFUSED', async () => {
+    fs.writeFileSync(p('cfg.json'), '{"a":1,"b":2}');
+    const e = await ctx.err('safe_edit', { path: p('cfg.json'), edits: [{ old: '"b":2', new: '"b":' }] });
+    assert.ok(e);
+    assert.match(e.error, /unparseable/);
+    assert.equal(fs.readFileSync(p('cfg.json'), 'utf8'), '{"a":1,"b":2}');
+  });
+
+  test('removing a JSON key is REFUSED', async () => {
+    fs.writeFileSync(p('cfg.json'), '{"a":1,"b":2}');
+    const e = await ctx.err('safe_edit', { path: p('cfg.json'), edits: [{ old: ',"b":2', new: '' }] });
+    assert.match(e.error, /key:b/);
+  });
+
+  test('a Python edit that removes a method is REFUSED', async () => {
+    fs.writeFileSync(p('m.py'), 'class R:\n    def start(self):\n        pass\n\n    def stop(self):\n        pass\n');
+    const e = await ctx.err('safe_edit', { path: p('m.py'), edits: [{ old: '\n    def stop(self):\n        pass\n', new: '' }] });
+    assert.ok(e);
+    assert.match(e.error, /method:R\.stop/);
+  });
+
+  test('additions are reported but never blocked', async () => {
+    const out = await ctx.call('safe_edit', {
+      path: p('mod.js'),
+      edits: [{ old: 'export const GAMMA = 3;', new: 'export const GAMMA = 3;\nexport function delta(){ return 4; }' }],
+    });
+    assert.ok(out.structure.added.includes('export.function:delta'));
+    assert.deepEqual(out.structure.removed, []);
+  });
+
+  test('an unanalysable file type is edited but flagged as unguaranteed', async () => {
+    fs.writeFileSync(p('thing.ts'), 'const a: number = 1;\n');
+    const out = await ctx.call('safe_edit', { path: p('thing.ts'), edits: [{ old: '= 1', new: '= 2' }] });
+    assert.equal(out.structure.checked, false);
+    assert.match(out.structure.warning, /NO STRUCTURAL GUARANTEE/);
+    assert.equal(fs.readFileSync(p('thing.ts'), 'utf8'), 'const a: number = 2;\n');
+  });
+
+  test('check_structure:false switches the gate off and says so', async () => {
+    const out = await ctx.call('safe_edit', {
+      path: p('mod.js'),
+      edits: [{ old: 'export function beta(){ return 2; }\n', new: '' }],
+      check_structure: false,
+    });
+    assert.equal(out.structure.checked, false);
+    assert.match(out.structure.warning, /switched off/);
+  });
+
+  test('preview runs the gate too, so a refusal is visible before writing', async () => {
+    const e = await ctx.err('safe_preview', {
+      path: p('mod.js'),
+      edits: [{ old: 'export function beta(){ return 2; }\n', new: '' }],
+    });
+    assert.ok(e, 'preview must fail wherever the real edit would fail');
+    assert.match(e.error, /would remove/);
+  });
+
+  test('an unbalanced markdown fence is reported', async () => {
+    fs.writeFileSync(p('doc.md'), '# Title\n\n```js\ncode\n```\n\ntext\n');
+    const out = await ctx.call('safe_edit', { path: p('doc.md'), edits: [{ old: '```\n\ntext', new: '\n\ntext' }] });
+    assert.ok(out.structure.notes.some((n) => /unbalanced code fences/.test(n)));
+  });
+});
+
+describe('the behavioural gate', () => {
+  beforeEach(() => {
+    fs.writeFileSync(p('lib.js'), 'export function add(a, b){ return a + b; }\n');
+    fs.writeFileSync(p('check.mjs'),
+      'import { add } from "./lib.js";\nif (add(2, 3) !== 5) { console.error("add is wrong"); process.exit(1); }\nconsole.log("ok");\n');
+  });
+
+  test('a passing verify_command lets the edit stand', async () => {
+    const out = await ctx.call('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_command: [process.execPath, p('check.mjs')],
+      verify_cwd: ctx.root,
+    });
+    assert.equal(out.verification.passed, true);
+    assert.match(fs.readFileSync(p('lib.js'), 'utf8'), /return b \+ a;/);
+  });
+
+  test('a failing verify_command ROLLS THE FILE BACK', async () => {
+    const before = fs.readFileSync(p('lib.js'), 'utf8');
+    const e = await ctx.err('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return a * b;' }],   // structurally fine, behaviourally wrong
+      verify_command: [process.execPath, p('check.mjs')],
+      verify_cwd: ctx.root,
+    });
+    assert.ok(e, 'a failing verification must not leave the edit in place');
+    assert.match(e.error, /ROLLED BACK/);
+    assert.equal(fs.readFileSync(p('lib.js'), 'utf8'), before, 'the file must be exactly as it was');
+    assert.equal(e.rolled_back, true);
+    assert.match(e.verification.output, /add is wrong/);
+  });
+
+  test('the rollback still leaves a backup of the attempt', async () => {
+    const e = await ctx.err('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return a * b;' }],
+      verify_command: [process.execPath, p('check.mjs')],
+      verify_cwd: ctx.root,
+    });
+    assert.ok(e.backup_id, 'the pre-edit content is still recoverable');
+  });
+
+  test('verify_command must be an argv array, never a shell string', async () => {
+    const e = await ctx.err('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_command: 'npm test; rm -rf /',
+    });
+    assert.ok(e);
+    assert.match(e.error, /array of strings/);
+  });
+
+  test('verify_cwd outside the allowed roots is denied', async () => {
+    const e = await ctx.err('safe_edit', {
+      path: p('lib.js'),
+      edits: [{ old: 'return a + b;', new: 'return b + a;' }],
+      verify_command: [process.execPath, '-e', 'process.exit(0)'],
+      verify_cwd: ctx.outside,
+    });
+    assert.match(e.error, /Access denied/);
   });
 });

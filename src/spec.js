@@ -21,6 +21,7 @@ import path from 'node:path';
 import { sha256, readFile } from './core.js';
 import { functionTree } from './functions.js';
 import { functionCoverage } from './coverage.js';
+import { classifyProbe } from './runner.js';
 
 export const SPEC_VERSION = 1;
 
@@ -37,6 +38,7 @@ export function buildSpec(abs, content, runVerification, opts = {}) {
     verify_cwd: opts.verify_cwd || null,
     checkable: cov.checkable,
     reason: cov.reason || null,
+    baseline: cov.baseline || null,
     functions: {},
   };
 
@@ -116,8 +118,9 @@ export function checkSpec(abs, content, spec, runVerification, { probe = true } 
 
   // 2. does it still pass
   const live = runVerification(content);
-  result.checks.push({ check: 'verification passes', passed: live.passed, exit_code: live.exit_code });
-  if (!live.passed) {
+  const livePassed = live.outcome === 'passed';
+  result.checks.push({ check: 'verification passes', passed: livePassed, outcome: live.outcome, exit_code: live.exit_code });
+  if (!livePassed) {
     result.violations.push({ kind: 'verification_failed', detail: `the verification command fails on the current file (exit ${live.exit_code})` });
     return finish(result); // no point probing a red suite
   }
@@ -131,8 +134,9 @@ export function checkSpec(abs, content, spec, runVerification, { probe = true } 
         const applied = applyRecordedChange(content, mf.change);
         if (!applied) { result.warnings.push({ kind: 'falsification_unreplayable', function: name, detail: `the recorded breakage no longer matches the file: ${mf.change}` }); continue; }
         fs.writeFileSync(abs, applied, 'utf8');
-        const r = runVerification(applied);
-        if (r.passed) eroded.push({ function: name, rule: mf.rule, change: mf.change });
+        const c = classifyProbe(runVerification(applied));
+        if (!c.conclusive) { result.warnings.push({ kind: 'falsification_inconclusive', function: name, detail: `${mf.change}: ${c.note}` }); continue; }
+        if (!c.caught) eroded.push({ function: name, rule: mf.rule, change: mf.change });
       }
     }
   } finally {

@@ -8,6 +8,7 @@ import { inventory, compareInventories } from './inventory.js';
 import { changedLines, generateMutants, destructionProbe, summarise } from './probe.js';
 import { functionTree, compareTrees } from './functions.js';
 import { functionCoverage } from './coverage.js';
+import { makeRunner } from './runner.js';
 import {
   sha256, readFile, findAll, lineOf, replaceAt, diagnoseMiss,
   atomicWrite, backup, diff,
@@ -522,7 +523,7 @@ export function rebuildFunction(abs, { function_name, new_source, expect_sha256,
   // The anti-fitting gate: is the NEW implementation actually watched?
   const after = readFile(abs);
   const cwd = verify_cwd || path.dirname(abs);
-  const run = () => runVerification(verify_command, cwd, verify_timeout_ms);
+  const run = makeRunner(verify_command, cwd, verify_timeout_ms);
   let coverage;
   try {
     coverage = functionCoverageFor(abs, after.content, run, function_name);
@@ -547,7 +548,7 @@ export function rebuildFunction(abs, { function_name, new_source, expect_sha256,
 }
 
 function functionCoverageFor(abs, content, run, name) {
-  const cov = functionCoverage(abs, content, run, { include: [name], max_functions: 1, mutants_per_function: 2, max_runs: 4 });
+  const cov = functionCoverage(abs, content, run, { include: [name], max_functions: 1, mutants_per_function: 2, max_runs: 4, baseline_samples: 1 });
   if (cov.checkable === false) return { status: 'UNWATCHED', note: cov.reason };
   const f = cov.functions[0];
   return f || { status: 'UNWATCHED', note: 'the function could not be probed' };

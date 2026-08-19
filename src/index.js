@@ -10,6 +10,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { makeGuard, readFile, listBackups, readBackup, backup, atomicWrite, sha256, diff } from './core.js';
 import { editFile, writeFile, replaceLines, editFunction, rebuildFunction, runVerification, EditError } from './edit.js';
 import { buildSpec, writeSpec, readSpec, checkSpec } from './spec.js';
+import { makeRunner, establishBaseline } from './runner.js';
 import { functionTree } from './functions.js';
 import { functionCoverage } from './coverage.js';
 import { inventory, describeAnalyzers } from './inventory.js';
@@ -148,13 +149,27 @@ const TOOLS = {
       verify_command: { type: 'array', items: { type: 'string' } },
       verify_cwd: str, verify_timeout_ms: num,
       mutants_per_function: num, max_functions: num, max_runs: num,
+      cache_scope: { type: 'string', description: 'Opt in to a disk cache by naming what has not changed - a git SHA, a lockfile hash. Results are only reused within that scope, because a probe depends on every file in the repo, not just the one being probed. Omit for memory-only caching within this run, which is always sound.' },
       include: { type: 'array', items: { type: 'string' }, description: 'Only probe these function names.' },
     }, ['path', 'verify_command']),
     fn: (a) => {
       const abs = assertAllowed(a.path);
       const cwd = a.verify_cwd ? assertAllowed(a.verify_cwd) : undefined;
-      const run = () => runVerification(a.verify_command, cwd, a.verify_timeout_ms);
+      const run = makeRunner(a.verify_command, cwd, a.verify_timeout_ms, { cache_scope: a.cache_scope || null });
       return { path: abs, ...functionCoverage(abs, readFile(abs).content, run, a) };
+    },
+  },
+  safe_baseline: {
+    desc: 'Run the verification several times on the unmodified file and report whether it is green AND stable. Nothing this server measures can be believed on a red or flaky suite: a red baseline makes every function look watched, and a flaky one manufactures caught mutants at random. Check this before trusting any coverage number.',
+    schema: S({
+      path: str, verify_command: { type: 'array', items: { type: 'string' } },
+      verify_cwd: str, verify_timeout_ms: num,
+      samples: { type: 'number', description: 'How many identical runs to compare. Default 3.' },
+    }, ['verify_command']),
+    fn: (a) => {
+      const cwd = a.verify_cwd ? assertAllowed(a.verify_cwd) : undefined;
+      const run = makeRunner(a.verify_command, cwd, a.verify_timeout_ms);
+      return establishBaseline(run, { samples: a.samples });
     },
   },
   safe_spec_generate: {
@@ -168,7 +183,7 @@ const TOOLS = {
     fn: (a) => {
       const abs = assertAllowed(a.path);
       const cwd = a.verify_cwd ? assertAllowed(a.verify_cwd) : undefined;
-      const run = () => runVerification(a.verify_command, cwd, a.verify_timeout_ms);
+      const run = makeRunner(a.verify_command, cwd, a.verify_timeout_ms, { cache_scope: a.cache_scope || null });
       const spec = buildSpec(abs, readFile(abs).content, run, { ...a, verify_cwd: cwd, stamp: nowStamp() });
       const out = assertAllowed(a.spec_path || `${abs}.spec.json`);
       writeSpec(out, spec);
@@ -186,7 +201,7 @@ const TOOLS = {
       const specPath = assertAllowed(a.spec_path || `${abs}.spec.json`);
       const spec = readSpec(specPath);
       const cwd = a.verify_cwd ? assertAllowed(a.verify_cwd) : (spec.verify_cwd || undefined);
-      const run = () => runVerification(spec.verify_command, cwd, a.verify_timeout_ms);
+      const run = makeRunner(spec.verify_command, cwd, a.verify_timeout_ms);
       return checkSpec(abs, readFile(abs).content, spec, run, { probe: a.probe !== false });
     },
   },

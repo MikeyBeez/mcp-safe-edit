@@ -380,10 +380,10 @@ describe('atomicity', () => {
 });
 
 describe('tool surface', () => {
-  test('advertises the seventeen tools', async () => {
+  test('advertises the eighteen tools', async () => {
     const { tools } = await ctx.client.listTools();
     assert.deepEqual(tools.map((t) => t.name).sort(), [
-      'safe_allowed_roots', 'safe_analyzers', 'safe_edit', 'safe_edit_function',
+      'safe_allowed_roots', 'safe_analyzers', 'safe_baseline', 'safe_edit', 'safe_edit_function',
       'safe_function_report', 'safe_functions', 'safe_inventory',
       'safe_list_backups', 'safe_preview', 'safe_read', 'safe_rebuild_function',
       'safe_replace_lines', 'safe_restore', 'safe_spec_check',
@@ -1055,5 +1055,94 @@ describe('piece-by-piece rebuild', () => {
     });
     assert.ok(e);
     assert.equal(fs.readFileSync(p('calc.js'), 'utf8'), before);
+  });
+});
+
+describe('the trust layer', () => {
+  beforeEach(() => {
+    fs.writeFileSync(p('calc.js'), 'export function add(a, b) {\n  return a + b;\n}\n');
+    fs.writeFileSync(p('suite.mjs'), 'import { add } from "./calc.js";\nif (add(2,3) !== 5) process.exit(1);\n');
+  });
+
+  const baseline = (cmd, extra = {}) => ctx.call('safe_baseline', {
+    verify_command: cmd, verify_cwd: ctx.root, ...extra,
+  });
+
+  test('a green stable suite is usable', async () => {
+    const b = await baseline([process.execPath, p('suite.mjs')]);
+    assert.equal(b.usable, true);
+    assert.equal(b.status, 'green');
+    assert.equal(b.samples, 3);
+    assert.ok(typeof b.median_ms === 'number');
+  });
+
+  test('a suite that already fails is refused as a baseline', async () => {
+    fs.writeFileSync(p('suite.mjs'), 'process.exit(1);\n');
+    const b = await baseline([process.execPath, p('suite.mjs')]);
+    assert.equal(b.usable, false);
+    assert.equal(b.status, 'red');
+    assert.match(b.reason, /rubber stamp/);
+  });
+
+  test('a flaky suite is detected and refused', async () => {
+    // Alternates on a counter file, so identical input gives different results.
+    fs.writeFileSync(p('counter.txt'), '0');
+    fs.writeFileSync(p('flaky.mjs'),
+      'import fs from "node:fs";\n' +
+      `const f = ${JSON.stringify(p('counter.txt'))};\n` +
+      'const n = Number(fs.readFileSync(f, "utf8")) + 1;\n' +
+      'fs.writeFileSync(f, String(n));\n' +
+      'process.exit(n % 2);\n');
+    const b = await baseline([process.execPath, p('flaky.mjs')], { samples: 4 });
+    assert.equal(b.usable, false);
+    assert.equal(b.status, 'flaky');
+    assert.match(b.reason, /different results on identical input/);
+  });
+
+  test('a command that cannot run is reported as crashed, not failed', async () => {
+    const b = await baseline(['/nonexistent/binary/xyz']);
+    assert.equal(b.usable, false);
+    assert.equal(b.status, 'crashed');
+  });
+
+  test('a red baseline stops the coverage report rather than reporting everything watched', async () => {
+    fs.writeFileSync(p('suite.mjs'), 'process.exit(1);\n');
+    const r = await ctx.call('safe_function_report', {
+      path: p('calc.js'), verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root,
+    });
+    assert.equal(r.checkable, false);
+    assert.equal(r.baseline.status, 'red');
+    assert.deepEqual(r.functions, [], 'no per-function claims may be made on a red baseline');
+  });
+
+  test('the report records the baseline it relied on', async () => {
+    const r = await ctx.call('safe_function_report', {
+      path: p('calc.js'), verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root,
+    });
+    assert.equal(r.baseline.status, 'green');
+    assert.ok(r.baseline.samples >= 1);
+  });
+
+  test('identical probes inside one run are memoised', async () => {
+    const r = await ctx.call('safe_function_report', {
+      path: p('calc.js'), verify_command: [process.execPath, p('suite.mjs')], verify_cwd: ctx.root,
+      mutants_per_function: 3,
+    });
+    assert.ok(r.cache, 'cache stats should be reported');
+    assert.equal(r.cache.scope, 'memory-only (this run)');
+  });
+
+  test('a rewritten test suite is NOT served from cache', async () => {
+    // The bug this guards: a probe result is not a pure function of the file
+    // being probed. It depends on the test files too. Keying the cache on the
+    // probed content alone served a stale answer from a stronger suite.
+    const strong = [process.execPath, p('suite.mjs')];
+    let r = await ctx.call('safe_function_report', { path: p('calc.js'), verify_command: strong, verify_cwd: ctx.root });
+    assert.equal(r.functions.find((f) => f.name === 'add').status, 'watched');
+
+    fs.writeFileSync(p('suite.mjs'), 'import { add } from "./calc.js";\nif (typeof add !== "function") process.exit(1);\n');
+    r = await ctx.call('safe_function_report', { path: p('calc.js'), verify_command: strong, verify_cwd: ctx.root });
+    assert.equal(r.functions.find((f) => f.name === 'add').status, 'UNWATCHED',
+      'the weakened suite must be measured, not the cached answer from the strong one');
   });
 });

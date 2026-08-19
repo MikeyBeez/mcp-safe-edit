@@ -431,16 +431,17 @@ describe('structural inventory', () => {
   });
 
   test('admits when it cannot analyse a file type', async () => {
-    fs.writeFileSync(p('x.ts'), 'const a: number = 1;\n');
-    const inv = await ctx.call('safe_inventory', { path: p('x.ts') });
+    fs.writeFileSync(p('main.rs'), 'fn main() { println!("hi"); }\n');
+    const inv = await ctx.call('safe_inventory', { path: p('main.rs') });
     assert.equal(inv.understood, false);
-    assert.match(inv.reason, /TypeScript/);
+    assert.match(inv.reason, /no structural analyzer/);
   });
 
   test('safe_analyzers says which types are covered', async () => {
     const a = await ctx.call('safe_analyzers');
-    assert.ok(a.supported.some((x) => x.ext === '.js'));
-    assert.ok(a.unsupported.some((x) => x.ext === '.ts'));
+    for (const ext of ['.js', '.py', '.json', '.md', '.ts']) {
+      assert.ok(a.supported.some((x) => x.ext === ext), `${ext} should be covered`);
+    }
   });
 });
 
@@ -529,11 +530,11 @@ describe('the structural gate', () => {
   });
 
   test('an unanalysable file type is edited but flagged as unguaranteed', async () => {
-    fs.writeFileSync(p('thing.ts'), 'const a: number = 1;\n');
-    const out = await ctx.call('safe_edit', { path: p('thing.ts'), edits: [{ old: '= 1', new: '= 2' }] });
+    fs.writeFileSync(p('thing.rs'), 'fn add(a: i32) -> i32 { a + 1 }\n');
+    const out = await ctx.call('safe_edit', { path: p('thing.rs'), edits: [{ old: 'a + 1', new: 'a + 2' }] });
     assert.equal(out.structure.checked, false);
     assert.match(out.structure.warning, /NO STRUCTURAL GUARANTEE/);
-    assert.equal(fs.readFileSync(p('thing.ts'), 'utf8'), 'const a: number = 2;\n');
+    assert.equal(fs.readFileSync(p('thing.rs'), 'utf8'), 'fn add(a: i32) -> i32 { a + 2 }\n');
   });
 
   test('check_structure:false switches the gate off and says so', async () => {
@@ -845,8 +846,8 @@ describe('editing by function name', () => {
   });
 
   test('a file type with no parser says so rather than guessing', async () => {
-    fs.writeFileSync(p('x.ts'), 'export function f(a: number) { return a; }\n');
-    const e = await ctx.err('safe_edit_function', { path: p('x.ts'), function_name: 'f', new_source: 'x' });
+    fs.writeFileSync(p('x.rs'), 'fn f(a: i32) -> i32 { a }\n');
+    const e = await ctx.err('safe_edit_function', { path: p('x.rs'), function_name: 'f', new_source: 'x' });
     assert.match(e.error, /Cannot address by function/);
   });
 });
@@ -1144,5 +1145,79 @@ describe('the trust layer', () => {
     r = await ctx.call('safe_function_report', { path: p('calc.js'), verify_command: strong, verify_cwd: ctx.root });
     assert.equal(r.functions.find((f) => f.name === 'add').status, 'UNWATCHED',
       'the weakened suite must be measured, not the cached answer from the strong one');
+  });
+});
+
+describe('TypeScript', () => {
+  beforeEach(() => {
+    fs.writeFileSync(p('svc.ts'),
+      'import fs from "node:fs";\n' +
+      'export interface Opts { path: string; depth: number }\n' +
+      'export type Id = string;\n' +
+      'export function load(o: Opts): Id {\n' +
+      '  const clean = (s: string): string => s.trim();\n' +
+      '  return clean(o.path);\n' +
+      '}\n' +
+      'export class Svc {\n' +
+      '  private count = 0;\n' +
+      '  run(n: number): number { return n + this.count; }\n' +
+      '}\n');
+  });
+
+  test('reads a real TypeScript file with the real compiler', async () => {
+    const inv = await ctx.call('safe_inventory', { path: p('svc.ts') });
+    assert.equal(inv.understood, true);
+    assert.equal(inv.language, 'typescript');
+    assert.ok(inv.symbols.includes('export.function:load'));
+    assert.ok(inv.symbols.includes('export.class:Svc'));
+    assert.ok(inv.symbols.includes('method:Svc.run'));
+    assert.deepEqual(inv.imports, ['node:fs']);
+  });
+
+  test('types are part of the contract', async () => {
+    const inv = await ctx.call('safe_inventory', { path: p('svc.ts') });
+    assert.ok(inv.symbols.includes('export.interface:Opts'), 'an exported interface is a promise to consumers');
+    assert.ok(inv.symbols.includes('export.type:Id'));
+  });
+
+  test('deleting an exported interface is REFUSED, though no runtime check would notice', async () => {
+    const before = fs.readFileSync(p('svc.ts'), 'utf8');
+    const e = await ctx.err('safe_edit', {
+      path: p('svc.ts'),
+      edits: [{ old: 'export interface Opts { path: string; depth: number }\n', new: '' }],
+    });
+    assert.ok(e, 'losing an exported type must be refused');
+    assert.match(e.error, /Opts/);
+    assert.equal(fs.readFileSync(p('svc.ts'), 'utf8'), before);
+  });
+
+  test('the function tree includes arrows nested inside typed functions', async () => {
+    const t = await ctx.call('safe_functions', { path: p('svc.ts') });
+    const names = t.functions.map((f) => f.name);
+    assert.ok(names.includes('load'));
+    assert.ok(names.includes('load.clean'), 'an arrow inside a typed function must be found');
+    assert.ok(names.includes('Svc.run'));
+  });
+
+  test('a type annotation is not mistaken for broken syntax', async () => {
+    const out = await ctx.call('safe_edit', { path: p('svc.ts'), edits: [{ old: 'return n + this.count;', new: 'return n + this.count + 0;' }] });
+    assert.equal(out.structure.checked, true, 'TypeScript must be checked, not waved through');
+    assert.deepEqual(out.structure.removed, []);
+  });
+
+  test('an edit that breaks TypeScript syntax is REFUSED', async () => {
+    const before = fs.readFileSync(p('svc.ts'), 'utf8');
+    const e = await ctx.err('safe_edit', { path: p('svc.ts'), edits: [{ old: 'export class Svc {', new: 'export class Svc {{{' }] });
+    assert.ok(e);
+    assert.match(e.error, /unparseable/);
+    assert.equal(fs.readFileSync(p('svc.ts'), 'utf8'), before);
+  });
+
+  test('a TypeScript function can be replaced by name', async () => {
+    await ctx.call('safe_edit_function', {
+      path: p('svc.ts'), function_name: 'load',
+      new_source: 'export function load(o: Opts): Id {\n  const clean = (s: string): string => s.trim();\n  return clean(o.path).toLowerCase();\n}',
+    });
+    assert.match(fs.readFileSync(p('svc.ts'), 'utf8'), /toLowerCase/);
   });
 });

@@ -15,6 +15,7 @@
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import * as acorn from 'acorn';
+import { available as tsAvailable, unavailableReason as tsReason, tsFunctions } from './ts-analyzer.js';
 
 // ---------------------------------------------------------------------------
 // JavaScript
@@ -139,15 +140,25 @@ function pyFunctions(content) {
 
 // ---------------------------------------------------------------------------
 
-const BY_EXT = { '.js': jsFunctions, '.mjs': jsFunctions, '.cjs': jsFunctions, '.py': pyFunctions };
+const BY_EXT = {
+  '.js': jsFunctions, '.mjs': jsFunctions, '.cjs': jsFunctions,
+  '.py': pyFunctions,
+  '.ts': (content, fp) => tsFunctions(fp, content),
+  '.tsx': (content, fp) => tsFunctions(fp, content),
+};
+const NEEDS_TS = new Set(['.ts', '.tsx']);
 
 export function functionTree(filePath, content) {
-  const fn = BY_EXT[path.extname(filePath).toLowerCase()];
+  const ext = path.extname(filePath).toLowerCase();
+  if (NEEDS_TS.has(ext) && !tsAvailable()) {
+    return { understood: false, reason: tsReason(), functions: [] };
+  }
+  const fn = BY_EXT[ext];
   if (!fn) {
     return { understood: false, reason: `no function parser for "${path.extname(filePath) || 'extensionless'}" files`, functions: [] };
   }
   try {
-    return { understood: true, functions: fn(content) };
+    return { understood: true, functions: fn(content, filePath) };
   } catch (e) {
     if (e.parseError) return { understood: true, parse_error: e.message, functions: [] };
     return { understood: false, reason: e.message, functions: [] };

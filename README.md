@@ -171,29 +171,61 @@ question you did not ask.
 
 ## What can and cannot be checked
 
-    .js .mjs .cjs   full parse (acorn) — functions, classes, methods, exports, imports
-    .py             full parse (python ast) — functions, classes, methods, imports
-    .json           every key path
-    .md             headings, plus unbalanced code fences
+    .js .mjs .cjs   acorn        functions, classes, methods, exports, imports
+    .ts .tsx        typescript   the above, plus interfaces, type aliases, enums
+    .py             python ast   functions, classes, methods, imports
+    .json           parse        every key path
+    .md             scan         headings, unbalanced code fences
 
-TypeScript has deliberately **no** analyzer. Parsing `.ts` with a JavaScript
-parser would choke on type annotations and report a healthy file as broken,
-which is worse than admitting the gap. Any unlisted type is edited textually and
-the result says so:
+TypeScript uses the real compiler, never the JavaScript parser with the types
+ignored — that would choke on an annotation and report a healthy file as broken.
+Exported interfaces and type aliases count as part of the contract, because
+deleting one breaks every consumer and no runtime check would ever notice.
 
-    NO STRUCTURAL GUARANTEE: no structural analyzer for ".ts" files.
+Pinned to typescript 5.x deliberately: TypeScript 7 is the Go rewrite, and its
+package no longer exports the classic compiler API from the main entry — the AST
+now lives under `./unstable/*`. A path with "unstable" in its name is not where
+a safety check belongs.
+
+Anything else is edited textually and the result says so:
+
+    NO STRUCTURAL GUARANTEE: no structural analyzer for ".rs" files.
     The text edit was applied exactly as asked, but nothing verified
     that this file still does what it did.
 
-That sentence is the whole discipline of this server pointed at itself. An
-analyzer that quietly returned "looks fine" for a file it could not parse would
-be the same bug one level up.
+That sentence is the discipline of this server pointed at itself. An analyzer
+that quietly returned "looks fine" for a file it could not parse would be the
+same bug one level up.
+
+## Before any number is believed
+
+A probe reads "the suite failed" as "the mutant was caught". Three things break
+that reading, and all three fail in the confident direction:
+
+- the suite was **already red** — then every breakage fails and everything looks watched
+- the suite is **flaky** — then caught mutants are manufactured at random
+- the runner **crashed or timed out** — not starting is not the tests objecting
+
+So `safe_baseline` runs the verification several times on the unmodified file
+first, and a red, flaky or crashed baseline means no per-function claim is made
+at all. A verification result is `passed / failed / timeout / crashed`, and only
+`failed` counts as caught; the rest are recorded as inconclusive.
+
+Caching follows one rule, learned the hard way when a stale hit reported an
+unwatched function as watched: **if you cannot name what has not changed, you do
+not get to cache it.** A probe depends on every file in the repo, not just the
+one being probed, so the default is memoisation within a single sweep and a disk
+cache requires an explicit `cache_scope` — a git SHA, a lockfile hash.
 
 ## Tools
 
     safe_read            read a file, get its sha256 token
     safe_inventory       what this file provides — the contract edits are checked against
     safe_analyzers       which file types get a guarantee, and which do not
+    safe_baseline        is your verification green and stable enough to trust
+    safe_spec_generate   write the spec: what must pass AND what must fail
+    safe_spec_check      still meets it? catches tests quietly getting weaker
+    safe_rebuild_function  rebuild one function, gated on it staying watched
     safe_functions       the function tree, including nested functions
     safe_edit_function   replace one function by name, not by text match
     safe_function_report which functions your tests would notice breaking
@@ -218,5 +250,5 @@ codebase, about an hour before this server was written.
 
     npm test
 
-92 assertions, no todos. They run the real server over stdio against a
+119 assertions, no todos. They run the real server over stdio against a
 throwaway sandbox — nothing is stubbed.

@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import * as acorn from 'acorn';
+import { available as tsAvailable, unavailableReason as tsReason, tsInventory } from './ts-analyzer.js';
 
 const EMPTY = () => ({ symbols: [], imports: [], notes: [] });
 
@@ -210,6 +211,12 @@ function mdInventory(content) {
 // Dispatch
 // ---------------------------------------------------------------------------
 
+// TypeScript is handled by the real compiler, never by the JavaScript parser
+// with the types ignored: that would choke on an annotation and report a
+// healthy file as broken. If the compiler is not installed the analyzer says so
+// rather than guessing.
+const withPath = (fn) => (content, filePath) => fn(filePath, content);
+
 const ANALYZERS = {
   '.js': { lang: 'javascript', fn: jsInventory },
   '.mjs': { lang: 'javascript', fn: jsInventory },
@@ -217,19 +224,18 @@ const ANALYZERS = {
   '.py': { lang: 'python', fn: pyInventory },
   '.json': { lang: 'json', fn: jsonInventory },
   '.md': { lang: 'markdown', fn: mdInventory },
+  '.ts': { lang: 'typescript', fn: withPath(tsInventory), needs: tsAvailable },
+  '.tsx': { lang: 'typescript', fn: withPath(tsInventory), needs: tsAvailable },
 };
 
-// TypeScript deliberately has NO analyzer. Parsing it with the JavaScript
-// parser would fail on type annotations and read as "file is broken", which is
-// worse than admitting we cannot check it.
-const KNOWN_UNSUPPORTED = {
-  '.ts': 'TypeScript needs the typescript compiler, which is not installed here',
-  '.tsx': 'TypeScript needs the typescript compiler, which is not installed here',
-};
+const KNOWN_UNSUPPORTED = {};
 
 export function inventory(filePath, content) {
   const ext = path.extname(filePath).toLowerCase();
   const a = ANALYZERS[ext];
+  if (a && a.needs && !a.needs()) {
+    return { understood: false, language: a.lang, reason: tsReason(), ...EMPTY() };
+  }
   if (!a) {
     return {
       understood: false,
@@ -239,7 +245,7 @@ export function inventory(filePath, content) {
     };
   }
   try {
-    const r = a.fn(content);
+    const r = a.fn(content, filePath);
     return { understood: true, language: a.lang, ...r };
   } catch (e) {
     if (e.parseError) return { understood: true, language: a.lang, parse_error: e.message, ...EMPTY() };
@@ -272,8 +278,11 @@ export function compareInventories(before, after) {
 
 export function describeAnalyzers() {
   return {
-    supported: Object.entries(ANALYZERS).map(([ext, a]) => ({ ext, language: a.lang })),
-    unsupported: Object.entries(KNOWN_UNSUPPORTED).map(([ext, reason]) => ({ ext, reason })),
+    supported: Object.entries(ANALYZERS).filter(([, a]) => !a.needs || a.needs()).map(([ext, a]) => ({ ext, language: a.lang })),
+    unsupported: [
+      ...Object.entries(KNOWN_UNSUPPORTED).map(([ext, reason]) => ({ ext, reason })),
+      ...Object.entries(ANALYZERS).filter(([, a]) => a.needs && !a.needs()).map(([ext]) => ({ ext, reason: tsReason() })),
+    ],
     note: 'Any other extension is edited without a structural guarantee, and safe_edit will say so in its result.',
   };
 }

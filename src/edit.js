@@ -9,6 +9,7 @@ import { changedLines, generateMutants, destructionProbe, summarise } from './pr
 import { functionTree, compareTrees } from './functions.js';
 import { functionCoverage } from './coverage.js';
 import { makeRunner } from './runner.js';
+import { inferVerifyCommand } from './infer.js';
 import { editMetrics, choosePolicy, readVerifyState, writeVerifyState, recordRun } from './policy.js';
 import {
   sha256, readFile, findAll, lineOf, replaceAt, diagnoseMiss,
@@ -312,7 +313,23 @@ export function probeVerifier(abs, finalContent, beforeContent, command, cwd, ti
 
 const stripContent = ({ content, ...rest }) => rest;
 
-export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp, check_structure = true, allow_removals = [], verify_command, verify_cwd, verify_timeout_ms, verify_the_verifier = true, max_probes = 3, require_trustworthy_verification = false, verify_effort = 'auto', now = null }) {
+export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp, check_structure = true, allow_removals = [], verify_command, verify_cwd, verify_timeout_ms, verify_the_verifier = true, max_probes = 3, require_trustworthy_verification = false, verify_effort = 'auto', auto_verify = true, now = null }) {
+  // AUTO-VERIFY (2026-08-19). Mikey: "the server should run the appropriate tests."
+  // safe_edit could always run a verify_command; it just had no way to work one out,
+  // so an edit that omitted it silently got the structural gate and no tests. Now the
+  // absence of a command is a question we can answer instead of a reason to skip.
+  // Never silent: whatever is inferred is reported back on the result as `inferred_verification`.
+  let inferred_verification = null;
+  if (!verify_command && auto_verify) {
+    const guess = inferVerifyCommand(abs);
+    if (guess.command) {
+      verify_command = guess.command;
+      verify_cwd = verify_cwd || guess.cwd;
+      inferred_verification = guess;
+    } else {
+      inferred_verification = guess;   // records WHY nothing ran
+    }
+  }
   if (!Array.isArray(edits) || edits.length === 0) {
     throw new EditError('edits must be a non-empty array');
   }
@@ -329,6 +346,7 @@ export function editFile(abs, { edits, expect_sha256, dry_run = false, stamp, ch
   }
 
   const result = {
+    inferred_verification,   // what auto-verify worked out, or why it found nothing
     path: abs,
     dry_run,
     edits_applied: plan.length,

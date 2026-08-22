@@ -380,11 +380,11 @@ describe('atomicity', () => {
 });
 
 describe('tool surface', () => {
-  test('advertises the twenty tools', async () => {
+  test('advertises the twenty-one tools', async () => {
     const { tools } = await ctx.client.listTools();
     assert.deepEqual(tools.map((t) => t.name).sort(), [
       'safe_allowed_roots', 'safe_analyzers', 'safe_baseline', 'safe_edit', 'safe_edit_function',
-      'safe_function_report', 'safe_functions', 'safe_inventory',
+      'safe_edit_many', 'safe_function_report', 'safe_functions', 'safe_inventory',
       'safe_list_backups', 'safe_preview', 'safe_read', 'safe_rebuild_function',
       'safe_replace_lines', 'safe_repo_report', 'safe_repo_sources', 'safe_restore',
       'safe_spec_check', 'safe_spec_generate', 'safe_verify', 'safe_write',

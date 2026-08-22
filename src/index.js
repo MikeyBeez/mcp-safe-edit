@@ -9,6 +9,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { makeGuard, readFile, listBackups, readBackup, backup, atomicWrite, sha256, diff } from './core.js';
 import { editFile, writeFile, replaceLines, editFunction, rebuildFunction, runVerification, EditError } from './edit.js';
+import { editMany } from './many.js';
 import { buildSpec, writeSpec, readSpec, checkSpec } from './spec.js';
 import { makeRunner, establishBaseline } from './runner.js';
 import { repoReport, discoverSources } from './repo.js';
@@ -73,6 +74,25 @@ const TOOLS = {
       require_trustworthy_verification: { type: 'boolean', description: 'Default false. When true, an edit whose verification proved uninformative is rolled back rather than merely reported.' },
     }, ['path', 'edits']),
     fn: (a) => editFile(assertAllowed(a.path), {
+      ...a,
+      verify_cwd: a.verify_cwd ? assertAllowed(a.verify_cwd) : undefined,
+      stamp: nowStamp(),
+    }),
+  },
+  safe_edit_many: {
+    desc: 'Apply the SAME exact-text edits across many files, all-or-nothing. Every file is planned and put through its structural gate BEFORE anything is written, so a sweep that would gut one file writes nothing at all — unlike a stream editor, which edits as it goes and leaves the first thirty-six files changed when the thirty-seventh is the problem. Matching is literal, so nothing in your search text is interpreted as a pattern. A file that does not contain the target is SKIPPED and reported by name, not silently ignored and not treated as an error. An optional verify_command runs ONCE after all writes; if it fails, every file is restored.',
+    schema: S({
+      paths: { type: 'array', items: { type: 'string' }, description: 'The files to sweep. Listed explicitly on purpose — there is no glob, so nothing is edited that you did not name.' },
+      edits: { type: 'array', items: EDIT_ITEM },
+      dry_run: { type: 'boolean', description: 'Plan every file and report what would change, writing nothing.' },
+      skip_unmatched: { type: 'boolean', description: 'Default true. A file with no match is skipped and listed. Set false to make a miss a failure that stops the sweep.' },
+      check_structure: { type: 'boolean', description: 'Default true. Refuses the whole sweep if any file would lose something it provides.' },
+      allow_removals: { type: 'array', items: { type: 'string' }, description: 'Names you INTEND to remove, applied to every file in the sweep.' },
+      verify_command: { type: 'array', items: { type: 'string' }, description: 'Argv array run ONCE after all writes, never through a shell. If it fails, every file is restored.' },
+      verify_cwd: { type: 'string' },
+      verify_timeout_ms: num,
+    }, ['paths', 'edits']),
+    fn: (a) => editMany((a.paths || []).map(assertAllowed), {
       ...a,
       verify_cwd: a.verify_cwd ? assertAllowed(a.verify_cwd) : undefined,
       stamp: nowStamp(),

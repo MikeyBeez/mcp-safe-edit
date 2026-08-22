@@ -176,13 +176,51 @@ export function functionAtLine(tree, line) {
 // Compare two trees. A function that vanished is the finding; a rename shows up
 // as one removal plus one addition, which is honest — we cannot know it was a
 // rename, and pretending to would be a guess.
+//
+// ANONYMOUS FUNCTIONS ARE COUNTED, NOT NAMED. An anonymous function has no name, so
+// functions.js calls it `<anonymous@LINE>`. That made its identity its POSITION, and
+// inserting a single line above it "removed" it and "added" a different one.
+//
+// Measured 2026-08-22: FIVE false refusals in one session. Each announced "the edit
+// would remove 24 functions this file defines" for edits that removed nothing -- a
+// comment block inserted near the top of a file shifted every arrow beneath it. Each
+// had to be re-sent with a hand-copied allow_removals list of two dozen names, which
+// is not a safety check, it is a toll booth. Worse, it TRAINS THE CALLER TO PASS
+// allow_removals REFLEXIVELY, and a caller in that habit waves through the real
+// removal this gate exists to catch. The last one it refused was this fix.
+//
+// So: named functions match by name, as before. Anonymous ones match by COUNT per
+// (kind, scope-with-line-numbers-stripped). A genuine deletion still shows up -- the
+// count drops -- while a pure line shift does not. What is given up is naming WHICH
+// anonymous function went, and that was never real: a line number is not an identity.
 export function compareTrees(before, after) {
   const key = (f) => `${f.kind}:${f.name}`;
-  const b = new Map(before.map((f) => [key(f), f]));
-  const a = new Map(after.map((f) => [key(f), f]));
-  return {
-    removed: [...b.keys()].filter((k) => !a.has(k)),
-    added: [...a.keys()].filter((k) => !b.has(k)),
-    kept: [...b.keys()].filter((k) => a.has(k)),
+  const ANON = /<anonymous@\d+>/;
+  const isAnon = (f) => ANON.test(f.name || '');
+  // Strip line numbers from the whole scope path so a shifted PARENT does not
+  // re-bucket its children: "promptProcess.<anonymous@363>" -> "promptProcess.<anon>".
+  const bucket = (f) => `${f.kind}:${String(f.name || '').replace(/<anonymous@\d+>/g, '<anon>')}`;
+
+  const b = new Map(before.filter((f) => !isAnon(f)).map((f) => [key(f), f]));
+  const a = new Map(after.filter((f) => !isAnon(f)).map((f) => [key(f), f]));
+
+  const removed = [...b.keys()].filter((k) => !a.has(k));
+  const added = [...a.keys()].filter((k) => !b.has(k));
+  const kept = [...b.keys()].filter((k) => a.has(k));
+
+  const tally = (list) => {
+    const m = new Map();
+    for (const f of list) if (isAnon(f)) m.set(bucket(f), (m.get(bucket(f)) || 0) + 1);
+    return m;
   };
+  const tb = tally(before), ta = tally(after);
+  for (const [k, n] of tb) {
+    const now = ta.get(k) || 0;
+    if (now < n) removed.push(`${k} ×${n - now} (anonymous; ${n} before, ${now} after)`);
+    else if (now > n) added.push(`${k} ×${now - n} (anonymous)`);
+    for (let i = 0; i < Math.min(n, now); i++) kept.push(k);
+  }
+  for (const [k, n] of ta) if (!tb.has(k)) added.push(`${k} ×${n} (anonymous)`);
+
+  return { removed, added, kept };
 }

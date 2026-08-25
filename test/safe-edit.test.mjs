@@ -1374,8 +1374,8 @@ describe('silent-removal holes closed', () => {
   });
 
   test('an argv element cannot be silently rewritten away', async () => {
-    fs.writeFileSync(p('cfg.json'), '{"args":["--root","/Users/bard/Code"]}');
-    const e = await ctx.err('safe_edit', { path: p('cfg.json'), edits: [{ old: '"/Users/bard/Code"', new: '"/"' }] });
+    fs.writeFileSync(p('cfg.json'), '{"args":["--root","/Users/example/Code"]}');
+    const e = await ctx.err('safe_edit', { path: p('cfg.json'), edits: [{ old: '"/Users/example/Code"', new: '"/"' }] });
     assert.ok(e, 'changing an allowed root in a config is a removal of the old value');
     assert.match(e.error, /args\.1/);
   });
